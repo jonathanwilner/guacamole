@@ -1162,7 +1162,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                 });
 
                 // Check for queue overflow
-                checkQueueOverflow(clientId);
+                checkQueueOverflow(clientId, realStream);
 
                 // Ensure timer is running
                 startQueueTimer(clientId, realStream);
@@ -1195,6 +1195,9 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
      *
      * @param {string} clientId
      *     The client ID.
+     *
+     * @param {Guacamole.OutputStream} realStream
+     *     The underlying stream that receives delayed blob data.
      *
      * @param {Guacamole.OutputStream} realStream
      *     The real stream to send delayed frames to.
@@ -1284,7 +1287,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
      *
      * @private
      */
-    function checkQueueOverflow(clientId) {
+    function checkQueueOverflow(clientId, realStream) {
         var queue = delayQueues[clientId];
         if (!queue)
             return;
@@ -1295,12 +1298,13 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
             totalSize += queue[i].size;
         }
 
-        // Drop oldest frames if over threshold
+        // If queue grows too large, flush in-order immediately instead of
+        // dropping arbitrary blobs. Dropping blob chunks can break frame
+        // boundaries and corrupt RDPECAM framing.
         if (totalSize > DELAY_QUEUE_OVERFLOW_THRESHOLD) {
-            // Drop oldest frames until under threshold
-            while (totalSize > DELAY_QUEUE_OVERFLOW_THRESHOLD && queue.length > 0) {
-                var dropped = queue.shift();
-                totalSize -= dropped.size;
+            while (queue.length > 0) {
+                var pending = queue.shift();
+                realStream.sendBlob(pending.data);
             }
         }
     }

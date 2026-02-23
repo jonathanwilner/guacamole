@@ -518,8 +518,253 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             result.set(new Uint8Array(arguments[i]), offset);
             offset += arguments[i].byteLength;
         }
-        
+
         return result.buffer;
+    };
+
+    /**
+     * Returns true if the given payload appears to be Annex-B byte stream
+     * format (contains a NAL start code near the beginning).
+     *
+     * @private
+     * @param {!Uint8Array} payload
+     * @returns {!boolean}
+     */
+    var isLikelyAnnexB = function isLikelyAnnexB(payload) {
+        if (!payload || payload.length < 4)
+            return false;
+
+        var maxScanOffset = Math.min(payload.length - 3, 16);
+        for (var i = 0; i < maxScanOffset; i++) {
+            if (payload[i] === 0x00 && payload[i + 1] === 0x00) {
+                if (payload[i + 2] === 0x01)
+                    return true;
+                if (i + 3 < payload.length && payload[i + 2] === 0x00 && payload[i + 3] === 0x01)
+                    return true;
+            }
+        }
+
+        return false;
+    };
+
+    /**
+     * Attempts AVCC->Annex-B conversion using a specific NALU length field
+     * size. Returns null if parsing fails.
+     *
+     * @private
+     * @param {!Uint8Array} payload
+     * @param {!number} lengthSize
+     * @param {!boolean} includeParamSets
+     * @returns {Uint8Array|null}
+     */
+    var avccToAnnexBWithLengthSize = function avccToAnnexBWithLengthSize(payload, lengthSize, includeParamSets) {
+        if (!payload || !payload.length || lengthSize < 1 || lengthSize > 4)
+            return null;
+
+        var startCode = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
+        var outParts = [];
+
+        if (includeParamSets && decoderConfig) {
+            var sps = decoderConfig.sps || [];
+            var pps = decoderConfig.pps || [];
+            for (var s = 0; s < sps.length; s++) {
+                outParts.push(startCode);
+                outParts.push(sps[s]);
+            }
+            for (var p = 0; p < pps.length; p++) {
+                outParts.push(startCode);
+                outParts.push(pps[p]);
+            }
+        }
+
+        var dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+        var offset = 0;
+        var nalCount = 0;
+
+        while (offset + lengthSize <= dv.byteLength) {
+            var nalLength = 0;
+            for (var i = 0; i < lengthSize; i++)
+                nalLength = (nalLength << 8) | dv.getUint8(offset + i);
+            offset += lengthSize;
+
+            if (nalLength <= 0)
+                continue;
+
+            if (offset + nalLength > dv.byteLength)
+                return null;
+
+            outParts.push(startCode);
+            outParts.push(new Uint8Array(payload.buffer, payload.byteOffset + offset, nalLength));
+            offset += nalLength;
+            nalCount++;
+        }
+
+        if (!nalCount)
+            return null;
+
+        var totalLength = 0;
+        for (var part = 0; part < outParts.length; part++)
+            totalLength += outParts[part].length;
+
+        var output = new Uint8Array(totalLength);
+        var writeOffset = 0;
+        for (var idx = 0; idx < outParts.length; idx++) {
+            output.set(outParts[idx], writeOffset);
+            writeOffset += outParts[idx].length;
+        }
+
+        return output;
+    };
+
+    /**
+     * Normalizes encoded H.264 payload into Annex-B format. This supports
+     * browsers that emit either Annex-B directly or AVCC with varying NALU
+     * length field sizes.
+     *
+     * @private
+     * @param {!Uint8Array} chunkData
+     * @param {!boolean} isKeyframe
+     * @returns {Uint8Array|null}
+     */
+    var normalizePayloadToAnnexB = function normalizePayloadToAnnexB(chunkData, isKeyframe) {
+        if (!chunkData || !chunkData.length)
+            return null;
+
+        // Some Chrome/Linux stacks emit Annex-B directly.
+        if (isLikelyAnnexB(chunkData))
+            return chunkData;
+
+        // First use the existing converter with decoder configuration, if any.
+        var converted = Guacamole.H264AnnexBUtil.avccToAnnexB(chunkData, isKeyframe, decoderConfig);
+        if (converted && converted.length)
+            return converted;
+
+        // If decoder config metadata is absent/incomplete, probe common AVCC
+        // length sizes used by browser encoders.
+        var tried = {};
+        var candidateSizes = [];
+        if (decoderConfig && decoderConfig.lengthSize)
+            candidateSizes.push(decoderConfig.lengthSize);
+        candidateSizes.push(4, 2, 1);
+
+        for (var i = 0; i < candidateSizes.length; i++) {
+            var lenSize = candidateSizes[i];
+            if (tried[lenSize])
+                continue;
+            tried[lenSize] = true;
+
+            converted = avccToAnnexBWithLengthSize(chunkData, lenSize, isKeyframe);
+            if (converted && converted.length)
+                return converted;
+        }
+
+        return null;
+    };
+
+    /**
+     * Selects an H.264 level ID based on capture resolution.
+     *
+     * @private
+     */
+    var selectLevelIdcHex = function selectLevelIdcHex(width, height) {
+        var mbW = Math.ceil((width || 0) / 16);
+        var mbH = Math.ceil((height || 0) / 16);
+        var mbPerFrame = mbW * mbH;
+        if (mbPerFrame <= 1620) return '1E';   // Level 3.0
+        if (mbPerFrame <= 3600) return '1F';   // Level 3.1
+        if (mbPerFrame <= 8192) return '28';   // Level 4.0
+        return '29';                            // Level 4.1 fallback
+    };
+
+    /**
+     * Returns the target bitrate for the current format.
+     *
+     * @private
+     */
+    var getTargetBitrate = function getTargetBitrate() {
+        if (format.height >= 1080) return 2700000;  // 2.7 Mbps for 1080p
+        if (format.height >= 720)  return 1250000;  // 1.25 Mbps for 720p
+        if (format.height >= 480)  return 700000;   // 700 kbps for 480p
+        if (format.height >= 360)  return 400000;   // 400 kbps for 360p
+        if (format.height >= 240)  return 170000;   // 170 kbps for 240p
+        return 100000;                               // 100 kbps for lower resolutions
+    };
+
+    /**
+     * Builds candidate encoder configs in compatibility order. Baseline
+     * profile and Annex-B are prioritized for interoperability.
+     *
+     * @private
+     * @returns {!Array.<Object>}
+     */
+    var buildEncoderConfigCandidates = function buildEncoderConfigCandidates() {
+        var level = selectLevelIdcHex(format.width, format.height);
+        var targetBitrate = getTargetBitrate();
+        var codecPrefixes = ['avc1.42E0', 'avc1.4D40', 'avc1.6400'];
+        var avcFormats = ['annexb', 'avc'];
+        var accelerationModes = ['prefer-hardware', 'prefer-software', null];
+        var candidates = [];
+
+        for (var c = 0; c < codecPrefixes.length; c++) {
+            var codecString = codecPrefixes[c] + level;
+            for (var f = 0; f < avcFormats.length; f++) {
+                for (var a = 0; a < accelerationModes.length; a++) {
+                    var candidate = {
+                        codec: codecString,
+                        width: format.width,
+                        height: format.height,
+                        framerate: format.frameRate,
+                        latencyMode: 'realtime',
+                        bitrate: targetBitrate,
+                        bitrateMode: 'variable',
+                        avc: { format: avcFormats[f] }
+                    };
+
+                    if (accelerationModes[a])
+                        candidate.hardwareAcceleration = accelerationModes[a];
+
+                    candidates.push(candidate);
+                }
+            }
+        }
+
+        return candidates;
+    };
+
+    /**
+     * Configures the active VideoEncoder using the first supported H.264
+     * candidate configuration.
+     *
+     * @private
+     * @returns {Promise<!Object>}
+     */
+    var configureEncoderWithFallback = function configureEncoderWithFallback() {
+        var candidates = buildEncoderConfigCandidates();
+        var index = 0;
+
+        var tryNext = function tryNext() {
+            if (index >= candidates.length)
+                return Promise.reject(new Error('No supported H.264 encoder configuration found'));
+
+            var candidate = candidates[index++];
+            var probe = Promise.resolve({ supported: true, config: candidate });
+
+            if (typeof VideoEncoder.isConfigSupported === 'function')
+                probe = VideoEncoder.isConfigSupported(candidate);
+
+            return probe.then(function(support) {
+                if (!support || !support.supported)
+                    throw new Error('Unsupported encoder config');
+
+                var effectiveConfig = support.config || candidate;
+                encoder.configure(effectiveConfig);
+                return effectiveConfig;
+            }).catch(function() {
+                return tryNext();
+            });
+        };
+
+        return tryNext();
     };
 
     /**
@@ -532,6 +777,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      *     user's local camera device.
      */
     var streamReceived = function streamReceived(stream) {
+        var track = null;
+
+        // Save stream early so cleanup paths can always stop tracks.
+        mediaStream = stream;
+        decoderConfig = null;
 
         // Create video encoder
         encoder = new VideoEncoder({
@@ -542,23 +792,14 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                 if (chunk.type === 'key')
                     markKeyframeObserved();
 
-                // Extract AVCC encoded data from browser
                 var chunkData = new Uint8Array(chunk.byteLength);
                 chunk.copyTo(chunkData);
 
-                // Convert AVCC to Annex B (prepend SPS/PPS on keyframes)
-                var payload = Guacamole.H264AnnexBUtil.avccToAnnexB(
-                    chunkData,
-                    chunk.type === 'key',
-                    decoderConfig
-                );
-
+                var payload = normalizePayloadToAnnexB(chunkData, chunk.type === 'key');
                 if (!payload || payload.length === 0)
                     return;
 
                 var payloadSize = payload.length;
-
-                // Ignore empty frames - nothing to send downstream
                 if (!payloadSize)
                     return;
 
@@ -581,92 +822,38 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
 
                 var payloadBuffer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payloadSize);
                 var frameData = concatBuffers(header, payloadBuffer);
-                
                 writer.sendData(frameData);
             },
-            error: function(e) {
-                if (recorder.onerror)
-                    recorder.onerror();
+            error: function() {
+                streamDenied();
             }
         });
 
-        // Select appropriate AVC level based on resolution
-        var selectLevelIdcHex = function(width, height) {
-            var mbW = Math.ceil((width || 0) / 16);
-            var mbH = Math.ceil((height || 0) / 16);
-            var mbPerFrame = mbW * mbH;
-            if (mbPerFrame <= 1620) return '1E';   // Level 3.0
-            if (mbPerFrame <= 3600) return '1F';   // Level 3.1
-            if (mbPerFrame <= 8192) return '28';   // Level 4.0
-            return '29';                            // Level 4.1 fallback
-        };
+        configureEncoderWithFallback().then(function() {
+            track = stream.getVideoTracks()[0];
+            if (!track)
+                throw new Error('Camera stream has no video track');
 
-        var codecString = 'avc1.6400' + selectLevelIdcHex(format.width, format.height);
+            reportCapabilities(track);
+            processor = new MediaStreamTrackProcessor({ track: track });
+            reader = processor.readable.getReader();
 
-        // Calculate optimal bitrate based on resolution height
-        // Matches FreeRDP's bitrate recommendations for RDPECAM
-        // Source: https://livekit.io/webrtc/bitrate-guide (webcam streaming)
-        var defaultBitrate;
-        if (format.height >= 1080) {
-            defaultBitrate = 2700000;  // 2.7 Mbps for 1080p
-        } else if (format.height >= 720) {
-            defaultBitrate = 1250000;  // 1.25 Mbps for 720p
-        } else if (format.height >= 480) {
-            defaultBitrate = 700000;   // 700 kbps for 480p
-        } else if (format.height >= 360) {
-            defaultBitrate = 400000;   // 400 kbps for 360p
-        } else if (format.height >= 240) {
-            defaultBitrate = 170000;   // 170 kbps for 240p
-        } else {
-            defaultBitrate = 100000;   // 100 kbps for lower resolutions
-        }
+            // Start encoding loop
+            (async function() {
+                while (true) {
+                    var result = await reader.read();
+                    if (result.done)
+                        break;
 
-        // Configure encoder
-        var encoderConfig = {
-            codec: codecString,
-            width: format.width,
-            height: format.height,
-            framerate: format.frameRate,
-            hardwareAcceleration: 'prefer-hardware',
-            latencyMode: 'quality',
-            bitrate: defaultBitrate,
-            bitrateMode: 'variable'
-        };
-
-        var effectiveEncoderConfig = encoderConfig;
-        try {
-            encoder.configure(encoderConfig);
-        }
-        catch (configureError) {
-            if (encoderConfig.colorSpace) {
-                effectiveEncoderConfig = Object.assign({}, encoderConfig);
-                delete effectiveEncoderConfig.colorSpace;
-                encoder.configure(effectiveEncoderConfig);
-            }
-            else
-                throw configureError;
-        }
-
-        // Create track processor
-        var track = stream.getVideoTracks()[0];
-        reportCapabilities(track);
-        processor = new MediaStreamTrackProcessor({ track: track });
-        reader = processor.readable.getReader();
-
-        // Start encoding loop
-        (async function() {
-            while (true) {
-                var result = await reader.read();
-                if (result.done) break;
-                var wantPeriodicIdr = (Date.now() - lastKeyframeWallMs) >= forceIdrIntervalMs;
-                var requestKey = needKeyframe || wantPeriodicIdr;
-                encoder.encode(result.value, { keyFrame: !!requestKey });
-                result.value.close();
-            }
-        })();
-
-        // Save stream for later cleanup
-        mediaStream = stream;
+                    var wantPeriodicIdr = (Date.now() - lastKeyframeWallMs) >= forceIdrIntervalMs;
+                    var requestKey = needKeyframe || wantPeriodicIdr;
+                    encoder.encode(result.value, { keyFrame: !!requestKey });
+                    result.value.close();
+                }
+            })();
+        }).catch(function() {
+            streamDenied();
+        });
 
     };
 
@@ -678,6 +865,29 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      * @private
      */
     var streamDenied = function streamDenied() {
+
+        try { if (reader && reader.cancel) reader.cancel(); } catch (e) {}
+        try { if (reader && reader.releaseLock) reader.releaseLock(); } catch (e) {}
+        try { if (encoder && encoder.flush) encoder.flush(); } catch (e) {}
+        try { if (encoder && encoder.close) encoder.close(); } catch (e) {}
+
+        if (mediaStream) {
+            try {
+                var tracks = mediaStream.getTracks();
+                for (var i = 0; i < tracks.length; i++)
+                    tracks[i].stop();
+            } catch (e) {}
+        }
+
+        processor = null;
+        reader = null;
+        encoder = null;
+        mediaStream = null;
+        decoderConfig = null;
+        baselinePtsUs = null;
+        lastOutputPtsMs = null;
+        requireKeyframe();
+        lastKeyframeWallMs = Date.now();
 
         // Simply end stream if camera access is not allowed
         writer.sendEnd();
