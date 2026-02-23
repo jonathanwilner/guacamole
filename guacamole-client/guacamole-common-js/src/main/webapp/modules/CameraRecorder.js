@@ -338,7 +338,25 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      *     Parsed configuration for conversion to Annex B.
      */
     var parseAvccDecoderConfig = function parseAvccDecoderConfig(avcc) {
-        var view = new DataView(avcc);
+        var buffer = null;
+        var byteOffset = 0;
+        var byteLength = 0;
+
+        if (avcc instanceof ArrayBuffer) {
+            buffer = avcc;
+            byteOffset = 0;
+            byteLength = avcc.byteLength;
+        }
+        else if (ArrayBuffer.isView(avcc) && avcc.buffer instanceof ArrayBuffer) {
+            buffer = avcc.buffer;
+            byteOffset = avcc.byteOffset || 0;
+            byteLength = avcc.byteLength || 0;
+        }
+        else {
+            throw new Error('Unsupported AVCC decoder configuration type');
+        }
+
+        var view = new DataView(buffer, byteOffset, byteLength);
         var offset = 0;
 
         /* configurationVersion, AVCProfileIndication, profile_compatibility, AVCLevelIndication */
@@ -359,7 +377,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             var spsLen = view.getUint16(offset);
             offset += 2;
             if (offset + spsLen > view.byteLength) break;
-            spsList.push(new Uint8Array(avcc, offset, spsLen));
+            spsList.push(new Uint8Array(buffer, byteOffset + offset, spsLen));
             offset += spsLen;
         }
 
@@ -373,7 +391,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                 var ppsLen = view.getUint16(offset);
                 offset += 2;
                 if (offset + ppsLen > view.byteLength) break;
-                ppsList.push(new Uint8Array(avcc, offset, ppsLen));
+                ppsList.push(new Uint8Array(buffer, byteOffset + offset, ppsLen));
                 offset += ppsLen;
             }
         }
@@ -786,8 +804,16 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         // Create video encoder
         encoder = new VideoEncoder({
             output: function(chunk, meta) {
-                if (meta && meta.decoderConfig && meta.decoderConfig.description)
-                    decoderConfig = parseAvccDecoderConfig(meta.decoderConfig.description);
+                if (meta && meta.decoderConfig && meta.decoderConfig.description) {
+                    try {
+                        decoderConfig = parseAvccDecoderConfig(meta.decoderConfig.description);
+                    }
+                    catch (e) {
+                        // Some Chromium/Linux builds expose description as a
+                        // different BufferSource shape; tolerate parse failure
+                        // and continue with fallback conversion paths.
+                    }
+                }
 
                 if (chunk.type === 'key')
                     markKeyframeObserved();
@@ -1000,7 +1026,19 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         if (!c) return;
         if (typeof c.width === 'number')  format.width  = c.width;
         if (typeof c.height === 'number') format.height = c.height;
-        if (typeof c.frameRate === 'number') format.frameRate = c.frameRate;
+        if (typeof c.frameRate === 'number') {
+            var targetFrameRate = c.frameRate;
+
+            // Linux Chrome is less consistent with H.264 encoder startup at
+            // 30 FPS. Cap requested FPS to 15 to improve RDPECAM stability.
+            if (typeof navigator !== 'undefined' && navigator.userAgent &&
+                    /Linux/i.test(navigator.userAgent) &&
+                    !/Android/i.test(navigator.userAgent)) {
+                targetFrameRate = Math.min(targetFrameRate, 15);
+            }
+
+            format.frameRate = targetFrameRate;
+        }
         if (c.deviceId) format.deviceId = c.deviceId;
     };
     /**
