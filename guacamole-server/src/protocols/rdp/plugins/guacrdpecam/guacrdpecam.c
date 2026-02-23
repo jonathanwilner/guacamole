@@ -773,6 +773,7 @@ static void *guac_rdp_rdpecam_dequeue_thread(void *arg) {
           pthread_mutex_lock(&device->lock);
           device->streaming = false;
           device->is_active_sender = false;
+          device->stream_session_refs = 0;
           pthread_cond_broadcast(&device->credits_signal);
           pthread_mutex_unlock(&device->lock);
           pthread_mutex_lock(&sink->lock);
@@ -1066,6 +1067,7 @@ static UINT guac_rdp_rdpecam_handle_data(
       device->credits = 0;
       device->streaming = false;
       device->is_active_sender = false;
+      device->stream_session_refs = 0;
       pthread_cond_broadcast(&device->credits_signal);
       pthread_mutex_unlock(&device->lock);
 
@@ -1182,7 +1184,7 @@ static UINT guac_rdp_rdpecam_handle_data(
                                       CAM_STREAM_FRAME_SOURCE_TYPE_Color,
                                   .Category = CAM_STREAM_CATEGORY_Capture,
                                   .Selected = 1,
-                                  .CanBeShared = 0};
+                                  .CanBeShared = 1};
     rs = Stream_New(NULL, 16);
     if (rs && rdpecam_build_stream_list(rs, &stream, 1)) {
       Stream_SealLength(rs);
@@ -1402,6 +1404,51 @@ static UINT guac_rdp_rdpecam_handle_data(
     Stream_Read_UINT32(stream, media_type.PixelAspectRatioDenominator);
     Stream_Read_UINT8(stream, media_type.Flags);
 
+    if (stream_idx == 0) {
+      bool already_streaming = false;
+      uint32_t stream_session_refs = 0;
+
+      pthread_mutex_lock(&device->lock);
+      if (device->streaming && device->stream_index == stream_idx) {
+        device->stream_session_refs++;
+        stream_session_refs = device->stream_session_refs;
+        if (!device->stream_channel)
+          device->stream_channel = channel;
+        device->stream_channel_id = channel_id;
+        pthread_cond_broadcast(&device->credits_signal);
+        already_streaming = true;
+      }
+      pthread_mutex_unlock(&device->lock);
+
+      if (already_streaming) {
+        rdpecam_channel_callback->is_stream_channel = true;
+
+        if (rdp_client->rdpecam_sink != device->sink)
+          rdp_client->rdpecam_sink = device->sink;
+
+        guac_client_log(client, GUAC_LOG_DEBUG,
+                        "RDPECAM StartStreams idempotent reuse for %s "
+                        "(stream=%u, refs=%" PRIu32 ")",
+                        device->device_name, stream_idx, stream_session_refs);
+
+        rs = Stream_New(NULL, 8);
+        if (rs && rdpecam_build_start_streams_response(rs, 0)) {
+          Stream_SealLength(rs);
+          const size_t out_len = Stream_Length(rs);
+          guac_rdp_rdpecam_log_stream(client, "TX", ch_name, channel_id, rs);
+          pthread_mutex_lock(&(rdp_client->message_lock));
+          result =
+              channel->Write(channel, (UINT32)out_len, Stream_Buffer(rs), NULL);
+          pthread_mutex_unlock(&(rdp_client->message_lock));
+          guac_client_log(client, GUAC_LOG_DEBUG,
+                          "RDPECAM TX ChannelId=%" PRIu32
+                          " MessageId=0x01 SuccessResponse (StartStreams reuse)",
+                          channel_id);
+        }
+        break;
+      }
+    }
+
     /* Handle camera switching: if another device is currently streaming,
      * stop it before starting this device (single-camera model).
      * Windows doesn't explicitly stop the old camera before starting the new
@@ -1433,6 +1480,7 @@ static UINT guac_rdp_rdpecam_handle_data(
             old_device->streaming = false;
             old_device->is_active_sender = false;
             old_device->credits = 0;
+            old_device->stream_session_refs = 0;
             old_device->stream_channel = NULL;
             old_device->stream_channel_id = 0;
             pthread_cond_broadcast(&old_device->credits_signal);
@@ -1480,6 +1528,7 @@ static UINT guac_rdp_rdpecam_handle_data(
       device->credits = 0;
       device->streaming = true;
       device->is_active_sender = true;
+      device->stream_session_refs = 1;
       device->stopping = false;
       device->stream_channel = channel;
       device->stream_channel_id = channel_id;
@@ -1584,6 +1633,7 @@ static UINT guac_rdp_rdpecam_handle_data(
 
     uint32_t outstanding = 0;
     uint32_t stream_index = 0;
+    uint32_t remaining_stream_refs = 0;
 
     pthread_mutex_lock(&device->lock);
     if (!device->stream_channel) {
@@ -1591,13 +1641,42 @@ static UINT guac_rdp_rdpecam_handle_data(
       pthread_cond_broadcast(&device->credits_signal);
     }
     rdpecam_channel_callback->is_stream_channel = true;
-    outstanding = device->credits;
     stream_index = device->stream_index;
-    device->credits = 0;
-    device->streaming = false;
-    device->is_active_sender = false;
+    if (device->stream_session_refs > 0)
+      device->stream_session_refs--;
+    remaining_stream_refs = device->stream_session_refs;
+
+    if (remaining_stream_refs == 0) {
+      outstanding = device->credits;
+      device->credits = 0;
+      device->streaming = false;
+      device->is_active_sender = false;
+    }
     pthread_cond_broadcast(&device->credits_signal);
     pthread_mutex_unlock(&device->lock);
+
+    if (remaining_stream_refs > 0) {
+      guac_client_log(client, GUAC_LOG_DEBUG,
+                      "RDPECAM StopStreams deferred teardown for %s "
+                      "(stream=%" PRIu32 ", refs=%" PRIu32 ")",
+                      device->device_name, stream_index, remaining_stream_refs);
+
+      rs = Stream_New(NULL, 8);
+      if (rs && rdpecam_build_stop_streams_response(rs, /*status*/ 0)) {
+        Stream_SealLength(rs);
+        const size_t out_len = Stream_Length(rs);
+        guac_rdp_rdpecam_log_stream(client, "TX", ch_name, channel_id, rs);
+        pthread_mutex_lock(&(rdp_client->message_lock));
+        result =
+            channel->Write(channel, (UINT32)out_len, Stream_Buffer(rs), NULL);
+        pthread_mutex_unlock(&(rdp_client->message_lock));
+        guac_client_log(client, GUAC_LOG_DEBUG,
+                        "RDPECAM TX ChannelId=%" PRIu32
+                        " MessageId=0x01 SuccessResponse (StopStreams deferred)",
+                        channel_id);
+      }
+      break;
+    }
 
     guac_rdpecam_request_keyframe(device->sink);
 
@@ -1930,6 +2009,7 @@ guac_rdp_rdpecam_close(IWTSVirtualChannelCallback *channel_callback) {
       device->stream_channel = NULL;
       device->is_active_sender = false;
       device->streaming = false;
+      device->stream_session_refs = 0;
       pthread_cond_broadcast(&device->credits_signal);
     }
 
@@ -2360,6 +2440,7 @@ guac_rdpecam_device_create(guac_rdp_rdpecam_plugin *plugin,
   device->sample_sequence = 0;
   device->is_active_sender = false;
   device->streaming = false;
+  device->stream_session_refs = 0;
   device->stopping = false;
   device->ref_count = 1;
 

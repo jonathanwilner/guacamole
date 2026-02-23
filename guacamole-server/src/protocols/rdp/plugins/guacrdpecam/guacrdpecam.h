@@ -171,6 +171,12 @@ typedef struct guac_rdpecam_device {
     bool streaming;
 
     /**
+     * Number of active StartStreams sessions for this device stream.
+     * Streaming resources are only torn down when this reaches zero.
+     */
+    uint32_t stream_session_refs;
+
+    /**
      * Signal to stop the dequeue thread.
      * Set by channel close handler, checked by dequeue thread.
      */
