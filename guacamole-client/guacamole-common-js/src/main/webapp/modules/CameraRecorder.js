@@ -296,6 +296,22 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     var mediaStream = null;
 
     /**
+     * Whether camera start/retry attempts should be abandoned.
+     *
+     * @private
+     * @type {boolean}
+     */
+    var captureStartAborted = false;
+
+    /**
+     * Pending timer used for delayed camera-open retries.
+     *
+     * @private
+     * @type {number|null}
+     */
+    var pendingCaptureRetryTimer = null;
+
+    /**
      * The video encoder instance.
      *
      * @private
@@ -428,6 +444,59 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      */
     var forceIdrIntervalMs = (typeof window !== 'undefined' && window.GUAC_RDPECAM_FORCE_IDR_MS) ?
             (parseInt(window.GUAC_RDPECAM_FORCE_IDR_MS, 10) || 2000) : 2000;
+
+    /**
+     * Backoff delays used for retrying transient camera-open failures.
+     *
+     * @private
+     * @type {!Array.<number>}
+     */
+    var CAMERA_OPEN_RETRY_DELAYS_MS = [0, 150, 400, 900];
+
+    /**
+     * Returns whether the provided getUserMedia() error is likely transient
+     * and worth retrying (common on Linux when camera ownership is switching).
+     *
+     * @private
+     * @param {Error|Object} error
+     * @returns {boolean}
+     */
+    var isRetryableCameraOpenError = function isRetryableCameraOpenError(error) {
+        if (!error)
+            return false;
+
+        var name = error.name || '';
+        var message = error.message || '';
+
+        if (name === 'NotReadableError' || name === 'AbortError' || name === 'TrackStartError')
+            return true;
+
+        return /camera.*in use|device.*busy|could not start video source/i.test(message);
+    };
+
+    /**
+     * Builds browser video constraints from current recorder format.
+     *
+     * @private
+     * @returns {!Object}
+     */
+    var buildVideoConstraints = function buildVideoConstraints() {
+        var videoConstraints = {
+            width: format.width,
+            height: format.height,
+            frameRate: format.frameRate
+        };
+
+        if (format.deviceId) {
+            try {
+                videoConstraints.deviceId = { exact: format.deviceId };
+            } catch (e) {
+                videoConstraints.deviceId = format.deviceId;
+            }
+        }
+
+        return videoConstraints;
+    };
 
     /**
      * Wall-clock timestamp (ms) of last observed keyframe.
@@ -795,6 +864,13 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      *     user's local camera device.
      */
     var streamReceived = function streamReceived(stream) {
+        if (captureStartAborted) {
+            try {
+                stream.getTracks().forEach(function(track) { track.stop(); });
+            } catch (e) {}
+            return;
+        }
+
         var track = null;
 
         // Save stream early so cleanup paths can always stop tracks.
@@ -891,6 +967,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      * @private
      */
     var streamDenied = function streamDenied() {
+        captureStartAborted = true;
+        if (pendingCaptureRetryTimer !== null) {
+            clearTimeout(pendingCaptureRetryTimer);
+            pendingCaptureRetryTimer = null;
+        }
 
         try { if (reader && reader.cancel) reader.cancel(); } catch (e) {}
         try { if (reader && reader.releaseLock) reader.releaseLock(); } catch (e) {}
@@ -934,26 +1015,39 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      * @private
      */
     var beginVideoCapture = function beginVideoCapture() {
-
-        // Attempt to retrieve a video input stream from the browser
-        var videoConstraints = {
-            width: format.width,
-            height: format.height,
-            frameRate: format.frameRate
-        };
-        if (format.deviceId) {
-            try {
-                videoConstraints.deviceId = { exact: format.deviceId };
-            } catch (e) {
-                // Fallback: string assignment if object form not supported
-                videoConstraints.deviceId = format.deviceId;
-            }
+        captureStartAborted = false;
+        if (pendingCaptureRetryTimer !== null) {
+            clearTimeout(pendingCaptureRetryTimer);
+            pendingCaptureRetryTimer = null;
         }
-        var promise = navigator.mediaDevices.getUserMedia({ 'video': videoConstraints });
 
-        // Handle stream creation/rejection via Promise
-        if (promise && promise.then)
-            promise.then(streamReceived, streamDenied);
+        var tryOpenCamera = function tryOpenCamera(attempt) {
+            if (captureStartAborted)
+                return;
+
+            var promise = navigator.mediaDevices.getUserMedia({ 'video': buildVideoConstraints() });
+
+            if (promise && promise.then) {
+                promise.then(streamReceived, function(error) {
+                    if (captureStartAborted)
+                        return;
+
+                    var nextAttempt = attempt + 1;
+                    if (isRetryableCameraOpenError(error) &&
+                            nextAttempt < CAMERA_OPEN_RETRY_DELAYS_MS.length) {
+                        pendingCaptureRetryTimer = setTimeout(function() {
+                            pendingCaptureRetryTimer = null;
+                            tryOpenCamera(nextAttempt);
+                        }, CAMERA_OPEN_RETRY_DELAYS_MS[nextAttempt]);
+                        return;
+                    }
+
+                    streamDenied();
+                });
+            }
+        };
+
+        tryOpenCamera(0);
 
     };
 
@@ -965,6 +1059,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      * @private
      */
     var stopVideoCapture = function stopVideoCapture() {
+        captureStartAborted = true;
+        if (pendingCaptureRetryTimer !== null) {
+            clearTimeout(pendingCaptureRetryTimer);
+            pendingCaptureRetryTimer = null;
+        }
 
         // Attempt graceful shutdown in order: reader, encoder, tracks
         try { if (reader && reader.cancel) reader.cancel(); } catch (e) {}

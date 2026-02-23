@@ -404,6 +404,10 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     function deriveFormatsFromCapabilities(capabilities) {
         const formats = [];
         const seen = {};
+        const linuxDesktop = (typeof navigator !== 'undefined' &&
+            navigator.userAgent &&
+            /Linux/i.test(navigator.userAgent) &&
+            !/Android/i.test(navigator.userAgent));
 
         const pushFormat = function(width, height, fpsNum, fpsDen) {
             const key = width + 'x' + height + '@' + fpsNum + '/' + fpsDen;
@@ -424,7 +428,14 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
             if (!capabilitySupportsValue(capabilities.height, candidate.height))
                 return;
 
-            candidate.fps.forEach(function(fps) {
+            var fpsCandidates = candidate.fps.slice();
+            if (linuxDesktop) {
+                fpsCandidates.sort(function(a, b) {
+                    return a - b;
+                });
+            }
+
+            fpsCandidates.forEach(function(fps) {
                 if (!capabilitySupportsValue(capabilities.frameRate, fps))
                     return;
                 pushFormat(candidate.width, candidate.height, fps, 1);
@@ -563,12 +574,34 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                     return;
                 }
 
-                // Probe capabilities for each device
-                var devicePromises = videoDevices.map(function(deviceInfo) {
-                    return probeDeviceCapabilities(deviceInfo.deviceId, deviceInfo.label || '');
-                });
+                // Probe capabilities sequentially. Some Linux camera drivers
+                // report "camera in use" if multiple getUserMedia() probes are
+                // opened in parallel.
+                var deviceCapabilities = [];
+                var probeSequentially = videoDevices.reduce(function(sequence, deviceInfo) {
+                    return sequence.then(function() {
+                        return probeDeviceCapabilities(deviceInfo.deviceId, deviceInfo.label || '')
+                            .then(function(caps) {
+                                if (caps)
+                                    deviceCapabilities.push(caps);
+                            })
+                            .catch(function(error) {
+                                // Keep the device with a conservative default
+                                // format so capability advertisement still works.
+                                if (deviceInfo.deviceId && deviceInfo.deviceId.trim()) {
+                                    deviceCapabilities.push({
+                                        deviceId: deviceInfo.deviceId,
+                                        deviceName: deviceInfo.label || '',
+                                        formats: deriveFormatsFromCapabilities({})
+                                    });
+                                }
+                                console.warn('Failed to probe camera capabilities for device:',
+                                    deviceInfo.deviceId, error);
+                            });
+                    });
+                }, Promise.resolve());
 
-                Promise.all(devicePromises).then(function(deviceCapabilities) {
+                probeSequentially.then(function() {
                     // Filter out devices with no capabilities or no device ID
                     var validDevices = deviceCapabilities.filter(function(dev) {
                         return dev && dev.deviceId && dev.deviceId.trim() && dev.formats && dev.formats.length > 0;
@@ -589,6 +622,21 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                         savedEnabledDevices = [];
                     }
 
+                    // Some Chromium/Linux setups rotate device IDs between
+                    // sessions. If none of the saved IDs match current IDs,
+                    // treat cameras as newly discovered and enable them.
+                    var savedDeviceIdsStale = false;
+                    if (!isFirstTime && Array.isArray(savedEnabledDevices) && savedEnabledDevices.length > 0) {
+                        var hasSavedMatch = validDevices.some(function(device) {
+                            return savedEnabledDevices.indexOf(device.deviceId) !== -1;
+                        });
+                        savedDeviceIdsStale = !hasSavedMatch;
+                    }
+
+                    if (savedDeviceIdsStale) {
+                        console.warn('RDPECAM detected stale camera device IDs in preferences; enabling newly discovered cameras.');
+                    }
+
                     // Build new registry
                     var newRegistry = {};
                     var deviceIdsChanged = false;
@@ -607,6 +655,9 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                             enabled = wasEnabled;
                         } else if (savedEnabledDevices.indexOf(device.deviceId) !== -1) {
                             // New camera that user previously enabled
+                            enabled = true;
+                        } else if (savedDeviceIdsStale) {
+                            // Device IDs rotated; recover by enabling discovered devices
                             enabled = true;
                         } else {
                             // New camera or user disabled it: default to disabled
