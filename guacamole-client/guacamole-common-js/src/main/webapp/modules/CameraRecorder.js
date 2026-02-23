@@ -160,6 +160,43 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     };
 
     /**
+     * Returns the browser user agent string if available.
+     *
+     * @private
+     * @returns {string}
+     */
+    var getUserAgentString = function getUserAgentString() {
+        if (typeof navigator === 'undefined')
+            return '';
+
+        return navigator.userAgent || '';
+    };
+
+    /**
+     * Returns whether the current browser should follow Android/mobile camera
+     * handling logic. HarmonyOS/OHOS is intentionally treated as Android-like.
+     *
+     * @private
+     * @returns {boolean}
+     */
+    var isAndroidLikeBrowser = function isAndroidLikeBrowser() {
+        var userAgent = getUserAgentString();
+        return /Android|HarmonyOS|OHOS|HongMeng/i.test(userAgent);
+    };
+
+    /**
+     * Returns whether the current browser should follow Linux desktop camera
+     * handling logic.
+     *
+     * @private
+     * @returns {boolean}
+     */
+    var isLinuxDesktopBrowser = function isLinuxDesktopBrowser() {
+        var userAgent = getUserAgentString();
+        return /Linux/i.test(userAgent) && !isAndroidLikeBrowser();
+    };
+
+    /**
      * Monotonic PTS last emitted downstream (milliseconds).
      *
      * @private
@@ -187,6 +224,17 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         { width: 320,  height: 240,  fps: [30, 15] },
         { width: 1280, height: 720,  fps: [30]      },
         { width: 1920, height: 1080, fps: [30]      }
+    ];
+
+    /**
+     * Conservative format list for Android-like browsers, including HarmonyOS.
+     *
+     * @private
+     * @type {!Array.<{width:number,height:number,fps:!Array.<number>}>}
+     */
+    var MOBILE_CAPABILITY_CANDIDATES = [
+        { width: 640,  height: 480,  fps: [15, 30] },
+        { width: 320,  height: 240,  fps: [15, 30] }
     ];
 
     /**
@@ -227,6 +275,9 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     var buildSupportedFormats = function buildSupportedFormats(capabilities) {
         var formats = [];
         var seen = {};
+        var androidLike = isAndroidLikeBrowser();
+        var linuxDesktop = isLinuxDesktopBrowser();
+        var candidates = androidLike ? MOBILE_CAPABILITY_CANDIDATES : CAPABILITY_CANDIDATES;
 
         var pushFormat = function pushFormat(width, height, fpsNum, fpsDen) {
             var key = width + 'x' + height + '@' + fpsNum + '/' + fpsDen;
@@ -242,13 +293,20 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             });
         };
 
-        CAPABILITY_CANDIDATES.forEach(function(candidate) {
+        candidates.forEach(function(candidate) {
             if (!capabilitySupportsValue(capabilities.width, candidate.width))
                 return;
             if (!capabilitySupportsValue(capabilities.height, candidate.height))
                 return;
 
-            candidate.fps.forEach(function(fps) {
+            var fpsCandidates = candidate.fps.slice();
+            if (linuxDesktop || androidLike) {
+                fpsCandidates.sort(function(a, b) {
+                    return a - b;
+                });
+            }
+
+            fpsCandidates.forEach(function(fps) {
                 if (!capabilitySupportsValue(capabilities.frameRate, fps))
                     return;
                 pushFormat(candidate.width, candidate.height, fps, 1);
@@ -475,13 +533,50 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     };
 
     /**
-     * Builds browser video constraints from current recorder format.
+     * Returns whether the provided getUserMedia() error indicates the current
+     * constraints cannot be satisfied and a fallback constraint set should be
+     * attempted.
      *
      * @private
-     * @returns {!Object}
+     * @param {Error|Object} error
+     * @returns {boolean}
      */
-    var buildVideoConstraints = function buildVideoConstraints() {
-        var videoConstraints = {
+    var isConstraintError = function isConstraintError(error) {
+        if (!error)
+            return false;
+
+        var name = error.name || '';
+        return name === 'OverconstrainedError' ||
+               name === 'ConstraintNotSatisfiedError' ||
+               name === 'NotFoundError' ||
+               name === 'NotAllowedError';
+    };
+
+    /**
+     * Builds camera capture constraint candidates from most specific to most
+     * permissive, including Android/HarmonyOS fallbacks.
+     *
+     * @private
+     * @returns {!Array.<(Object|boolean)>}
+     */
+    var buildCaptureConstraintCandidates = function buildCaptureConstraintCandidates() {
+        var candidates = [];
+        var seen = {};
+        var androidLike = isAndroidLikeBrowser();
+
+        var pushCandidate = function pushCandidate(videoConstraints) {
+            var key = (typeof videoConstraints === 'boolean')
+                ? ('bool:' + videoConstraints)
+                : JSON.stringify(videoConstraints || {});
+
+            if (seen[key])
+                return;
+
+            seen[key] = true;
+            candidates.push(videoConstraints);
+        };
+
+        var baseVideoConstraints = {
             width: format.width,
             height: format.height,
             frameRate: format.frameRate
@@ -489,13 +584,37 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
 
         if (format.deviceId) {
             try {
-                videoConstraints.deviceId = { exact: format.deviceId };
+                var exactDeviceConstraints = Object.assign({}, baseVideoConstraints, {
+                    deviceId: { exact: format.deviceId }
+                });
+                pushCandidate(exactDeviceConstraints);
             } catch (e) {
-                videoConstraints.deviceId = format.deviceId;
+                pushCandidate(Object.assign({}, baseVideoConstraints, {
+                    deviceId: format.deviceId
+                }));
+            }
+
+            if (androidLike) {
+                pushCandidate(Object.assign({}, baseVideoConstraints, {
+                    deviceId: { ideal: format.deviceId }
+                }));
             }
         }
 
-        return videoConstraints;
+        pushCandidate(baseVideoConstraints);
+
+        if (androidLike) {
+            pushCandidate({
+                width: { ideal: 640, max: 640 },
+                height: { ideal: 480, max: 480 },
+                frameRate: { ideal: 15, max: 15 }
+            });
+        }
+
+        // Last-resort fallback when strict constraints fail.
+        pushCandidate(true);
+
+        return candidates;
     };
 
     /**
@@ -789,7 +908,9 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         var targetBitrate = getTargetBitrate();
         var codecPrefixes = ['avc1.42E0', 'avc1.4D40', 'avc1.6400'];
         var avcFormats = ['annexb', 'avc'];
-        var accelerationModes = ['prefer-hardware', 'prefer-software', null];
+        var accelerationModes = isAndroidLikeBrowser()
+            ? ['prefer-software', 'prefer-hardware', null]
+            : ['prefer-hardware', 'prefer-software', null];
         var candidates = [];
 
         for (var c = 0; c < codecPrefixes.length; c++) {
@@ -1021,24 +1142,44 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             pendingCaptureRetryTimer = null;
         }
 
-        var tryOpenCamera = function tryOpenCamera(attempt) {
+        var constraintCandidates = buildCaptureConstraintCandidates();
+
+        var tryOpenCamera = function tryOpenCamera(attempt, constraintIndex) {
             if (captureStartAborted)
                 return;
 
-            var promise = navigator.mediaDevices.getUserMedia({ 'video': buildVideoConstraints() });
+            var index = constraintIndex || 0;
+            if (index >= constraintCandidates.length) {
+                streamDenied();
+                return;
+            }
+
+            var promise = navigator.mediaDevices.getUserMedia({
+                'video': constraintCandidates[index]
+            });
 
             if (promise && promise.then) {
                 promise.then(streamReceived, function(error) {
                     if (captureStartAborted)
                         return;
 
+                    if (isConstraintError(error) && (index + 1) < constraintCandidates.length) {
+                        tryOpenCamera(0, index + 1);
+                        return;
+                    }
+
                     var nextAttempt = attempt + 1;
                     if (isRetryableCameraOpenError(error) &&
                             nextAttempt < CAMERA_OPEN_RETRY_DELAYS_MS.length) {
                         pendingCaptureRetryTimer = setTimeout(function() {
                             pendingCaptureRetryTimer = null;
-                            tryOpenCamera(nextAttempt);
+                            tryOpenCamera(nextAttempt, index);
                         }, CAMERA_OPEN_RETRY_DELAYS_MS[nextAttempt]);
+                        return;
+                    }
+
+                    if ((index + 1) < constraintCandidates.length) {
+                        tryOpenCamera(0, index + 1);
                         return;
                     }
 
@@ -1047,7 +1188,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             }
         };
 
-        tryOpenCamera(0);
+        tryOpenCamera(0, 0);
 
     };
 
@@ -1123,16 +1264,28 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      */
     this.setFormat = function setFormat(c) {
         if (!c) return;
+
+        var linuxDesktop = isLinuxDesktopBrowser();
+        var androidLike = isAndroidLikeBrowser();
+
         if (typeof c.width === 'number')  format.width  = c.width;
         if (typeof c.height === 'number') format.height = c.height;
+
+        if (androidLike) {
+            // Keep Android/HarmonyOS constraints conservative to improve
+            // camera and encoder startup reliability.
+            if (typeof format.width === 'number')
+                format.width = Math.min(format.width, 640);
+            if (typeof format.height === 'number')
+                format.height = Math.min(format.height, 480);
+        }
+
         if (typeof c.frameRate === 'number') {
             var targetFrameRate = c.frameRate;
 
             // Linux Chrome is less consistent with H.264 encoder startup at
             // 30 FPS. Cap requested FPS to 15 to improve RDPECAM stability.
-            if (typeof navigator !== 'undefined' && navigator.userAgent &&
-                    /Linux/i.test(navigator.userAgent) &&
-                    !/Android/i.test(navigator.userAgent)) {
+            if (linuxDesktop || androidLike) {
                 targetFrameRate = Math.min(targetFrameRate, 15);
             }
 

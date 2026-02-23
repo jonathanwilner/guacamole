@@ -53,6 +53,13 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
         { width: 1920, height: 1080, fps: [30]      }
     ];
 
+    // More conservative set for mobile browsers where camera constraints and
+    // hardware encoders are less predictable.
+    const MOBILE_CAPABILITY_CANDIDATES = [
+        { width: 640,  height: 480,  fps: [15, 30] },
+        { width: 320,  height: 240,  fps: [15, 30] }
+    ];
+
     const probedClients = new WeakSet();
 
     /**
@@ -253,6 +260,47 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     }
 
     /**
+     * Returns the browser user agent string if available.
+     *
+     * @returns {string}
+     *     The user agent string, or an empty string.
+     *
+     * @private
+     */
+    function getUserAgentString() {
+        if (typeof navigator === 'undefined')
+            return '';
+
+        return navigator.userAgent || '';
+    }
+
+    /**
+     * Returns whether the current browser should follow Android/mobile camera
+     * handling logic. HarmonyOS/OHOS is intentionally treated as Android-like.
+     *
+     * @returns {boolean}
+     *
+     * @private
+     */
+    function isAndroidLikeClient() {
+        var userAgent = getUserAgentString();
+        return /Android|HarmonyOS|OHOS|HongMeng/i.test(userAgent);
+    }
+
+    /**
+     * Returns whether the current browser should follow Linux desktop camera
+     * handling logic.
+     *
+     * @returns {boolean}
+     *
+     * @private
+     */
+    function isLinuxDesktopClient() {
+        var userAgent = getUserAgentString();
+        return /Linux/i.test(userAgent) && !isAndroidLikeClient();
+    }
+
+    /**
      * Notifies all registered callbacks that the camera registry has changed.
      *
      * @private
@@ -404,10 +452,9 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     function deriveFormatsFromCapabilities(capabilities) {
         const formats = [];
         const seen = {};
-        const linuxDesktop = (typeof navigator !== 'undefined' &&
-            navigator.userAgent &&
-            /Linux/i.test(navigator.userAgent) &&
-            !/Android/i.test(navigator.userAgent));
+        const linuxDesktop = isLinuxDesktopClient();
+        const androidLike = isAndroidLikeClient();
+        const candidateFormats = androidLike ? MOBILE_CAPABILITY_CANDIDATES : CAPABILITY_CANDIDATES;
 
         const pushFormat = function(width, height, fpsNum, fpsDen) {
             const key = width + 'x' + height + '@' + fpsNum + '/' + fpsDen;
@@ -422,14 +469,14 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
             });
         };
 
-        CAPABILITY_CANDIDATES.forEach(function(candidate) {
+        candidateFormats.forEach(function(candidate) {
             if (!capabilitySupportsValue(capabilities.width, candidate.width))
                 return;
             if (!capabilitySupportsValue(capabilities.height, candidate.height))
                 return;
 
             var fpsCandidates = candidate.fps.slice();
-            if (linuxDesktop) {
+            if (linuxDesktop || androidLike) {
                 fpsCandidates.sort(function(a, b) {
                     return a - b;
                 });
@@ -626,6 +673,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                     // sessions. If none of the saved IDs match current IDs,
                     // treat cameras as newly discovered and enable them.
                     var savedDeviceIdsStale = false;
+                    var androidLikeClient = isAndroidLikeClient();
                     if (!isFirstTime && Array.isArray(savedEnabledDevices) && savedEnabledDevices.length > 0) {
                         var hasSavedMatch = validDevices.some(function(device) {
                             return savedEnabledDevices.indexOf(device.deviceId) !== -1;
@@ -676,6 +724,22 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                             deviceIdsChanged = true;
                         }
                     });
+
+                    // Mobile Chrome/HarmonyOS can rotate device IDs and redact
+                    // metadata aggressively. If nothing is enabled, recover by
+                    // enabling discovered cameras so capabilities are still sent.
+                    if (androidLikeClient) {
+                        var anyEnabled = Object.keys(newRegistry).some(function(deviceId) {
+                            return !!newRegistry[deviceId].enabled;
+                        });
+
+                        if (!anyEnabled) {
+                            Object.keys(newRegistry).forEach(function(deviceId) {
+                                newRegistry[deviceId].enabled = true;
+                            });
+                            deviceIdsChanged = true;
+                        }
+                    }
 
                     // Check for removed devices
                     Object.keys(cameraRegistry).forEach(function(deviceId) {
