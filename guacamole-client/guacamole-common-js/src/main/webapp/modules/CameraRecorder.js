@@ -173,6 +173,51 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     };
 
     /**
+     * Emits an RDPECAM debug event through the optional global hook installed
+     * by the webapp.
+     *
+     * @private
+     * @param {string} eventName
+     *     Short event name.
+     *
+     * @param {Object} payload
+     *     Event payload.
+     */
+    var emitDebugEvent = function emitDebugEvent(eventName, payload) {
+        if (typeof window === 'undefined')
+            return;
+
+        var hook = window.GUAC_RDPECAM_DEBUG_HOOK;
+        if (typeof hook !== 'function')
+            return;
+
+        try {
+            hook(eventName, payload || {});
+        }
+        catch (e) {}
+    };
+
+    /**
+     * Returns a JSON-safe representation of the given constraints object for
+     * debug telemetry.
+     *
+     * @private
+     * @param {(Object|boolean)} constraints
+     * @returns {(Object|boolean|string)}
+     */
+    var sanitizeConstraintsForDebug = function sanitizeConstraintsForDebug(constraints) {
+        if (typeof constraints === 'boolean')
+            return constraints;
+
+        try {
+            return JSON.parse(JSON.stringify(constraints || {}));
+        }
+        catch (e) {
+            return String(constraints);
+        }
+    };
+
+    /**
      * Returns whether the current browser should follow Android/mobile camera
      * handling logic. HarmonyOS/OHOS is intentionally treated as Android-like.
      *
@@ -966,6 +1011,16 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
 
                 var effectiveConfig = support.config || candidate;
                 encoder.configure(effectiveConfig);
+                emitDebugEvent('encoder-config-selected', {
+                    codec: effectiveConfig.codec,
+                    width: effectiveConfig.width,
+                    height: effectiveConfig.height,
+                    framerate: effectiveConfig.framerate,
+                    hardwareAcceleration: effectiveConfig.hardwareAcceleration || null,
+                    avcFormat: effectiveConfig.avc && effectiveConfig.avc.format
+                        ? effectiveConfig.avc.format
+                        : null
+                });
                 return effectiveConfig;
             }).catch(function() {
                 return tryNext();
@@ -1047,7 +1102,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                 var frameData = concatBuffers(header, payloadBuffer);
                 writer.sendData(frameData);
             },
-            error: function() {
+            error: function(error) {
+                emitDebugEvent('encoder-runtime-error', {
+                    name: error && error.name ? error.name : '',
+                    message: error && error.message ? error.message : ''
+                });
                 streamDenied();
             }
         });
@@ -1056,6 +1115,31 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             track = stream.getVideoTracks()[0];
             if (!track)
                 throw new Error('Camera stream has no video track');
+
+            var settings = {};
+            if (track && typeof track.getSettings === 'function') {
+                try {
+                    var rawSettings = track.getSettings() || {};
+                    settings = {
+                        width: rawSettings.width || null,
+                        height: rawSettings.height || null,
+                        frameRate: rawSettings.frameRate || null,
+                        deviceId: rawSettings.deviceId || null
+                    };
+                }
+                catch (e) {}
+            }
+
+            emitDebugEvent('camera-open-success', {
+                label: (track && track.label) ? track.label : '',
+                settings: settings,
+                requestedFormat: {
+                    width: format.width,
+                    height: format.height,
+                    frameRate: format.frameRate,
+                    deviceId: format.deviceId || null
+                }
+            });
 
             reportCapabilities(track);
             processor = new MediaStreamTrackProcessor({ track: track });
@@ -1074,7 +1158,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                     result.value.close();
                 }
             })();
-        }).catch(function() {
+        }).catch(function(error) {
+            emitDebugEvent('camera-capture-start-failed', {
+                name: error && error.name ? error.name : '',
+                message: error && error.message ? error.message : ''
+            });
             streamDenied();
         });
 
@@ -1093,6 +1181,15 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             clearTimeout(pendingCaptureRetryTimer);
             pendingCaptureRetryTimer = null;
         }
+
+        emitDebugEvent('camera-stream-denied', {
+            requestedFormat: {
+                width: format.width,
+                height: format.height,
+                frameRate: format.frameRate,
+                deviceId: format.deviceId || null
+            }
+        });
 
         try { if (reader && reader.cancel) reader.cancel(); } catch (e) {}
         try { if (reader && reader.releaseLock) reader.releaseLock(); } catch (e) {}
@@ -1154,6 +1251,13 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                 return;
             }
 
+            emitDebugEvent('camera-open-attempt', {
+                attempt: attempt,
+                constraintIndex: index,
+                constraints: sanitizeConstraintsForDebug(constraintCandidates[index]),
+                userAgent: getUserAgentString()
+            });
+
             var promise = navigator.mediaDevices.getUserMedia({
                 'video': constraintCandidates[index]
             });
@@ -1163,7 +1267,19 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                     if (captureStartAborted)
                         return;
 
+                    emitDebugEvent('camera-open-error', {
+                        attempt: attempt,
+                        constraintIndex: index,
+                        constraints: sanitizeConstraintsForDebug(constraintCandidates[index]),
+                        name: error && error.name ? error.name : '',
+                        message: error && error.message ? error.message : ''
+                    });
+
                     if (isConstraintError(error) && (index + 1) < constraintCandidates.length) {
+                        emitDebugEvent('camera-open-fallback-constraint', {
+                            fromConstraintIndex: index,
+                            toConstraintIndex: index + 1
+                        });
                         tryOpenCamera(0, index + 1);
                         return;
                     }
@@ -1171,6 +1287,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                     var nextAttempt = attempt + 1;
                     if (isRetryableCameraOpenError(error) &&
                             nextAttempt < CAMERA_OPEN_RETRY_DELAYS_MS.length) {
+                        emitDebugEvent('camera-open-retry-scheduled', {
+                            retryAttempt: nextAttempt,
+                            retryDelayMs: CAMERA_OPEN_RETRY_DELAYS_MS[nextAttempt],
+                            constraintIndex: index
+                        });
                         pendingCaptureRetryTimer = setTimeout(function() {
                             pendingCaptureRetryTimer = null;
                             tryOpenCamera(nextAttempt, index);
@@ -1179,6 +1300,10 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                     }
 
                     if ((index + 1) < constraintCandidates.length) {
+                        emitDebugEvent('camera-open-fallback-next', {
+                            fromConstraintIndex: index,
+                            toConstraintIndex: index + 1
+                        });
                         tryOpenCamera(0, index + 1);
                         return;
                     }
@@ -1205,6 +1330,8 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             clearTimeout(pendingCaptureRetryTimer);
             pendingCaptureRetryTimer = null;
         }
+
+        emitDebugEvent('camera-stop-local', {});
 
         // Attempt graceful shutdown in order: reader, encoder, tracks
         try { if (reader && reader.cancel) reader.cancel(); } catch (e) {}

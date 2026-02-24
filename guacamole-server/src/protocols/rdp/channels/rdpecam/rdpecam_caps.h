@@ -35,9 +35,10 @@
 #define GUAC_RDPECAM_ARG_CAPABILITIES_UPDATE "rdpecam-capabilities-update"
 
 /**
- * The name of the guacamole protocol argument for camera capability updates.
- * This is sent when the user enables/disables cameras during an active session.
+ * The name of the guacamole protocol argument for browser-side RDPECAM debug
+ * telemetry.
  */
+#define GUAC_RDPECAM_ARG_DEBUG "rdpecam-debug"
 
 /**
  * Maximum number of RDPECAM formats remembered from the browser.
@@ -150,5 +151,29 @@ size_t guac_rdp_rdpecam_sanitize_device_name(const char* name, char* sanitized, 
 int guac_rdp_rdpecam_capabilities_callback(guac_user* user,
         const char* mimetype, const char* name, const char* value, void* data);
 
-#endif
+/**
+ * Callback invoked when browser-side RDPECAM debug telemetry is received from
+ * the web client.
+ *
+ * @param user
+ *     The user who sent the debug payload.
+ *
+ * @param mimetype
+ *     The mimetype of the data.
+ *
+ * @param name
+ *     The argument name. Expected to be "rdpecam-debug".
+ *
+ * @param value
+ *     Debug payload sent by the browser.
+ *
+ * @param data
+ *     User-defined data (unused).
+ *
+ * @return
+ *     Always returns 0.
+ */
+int guac_rdp_rdpecam_debug_callback(guac_user* user,
+        const char* mimetype, const char* name, const char* value, void* data);
 
+#endif

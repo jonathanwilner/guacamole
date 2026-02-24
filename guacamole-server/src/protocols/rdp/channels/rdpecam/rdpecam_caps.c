@@ -325,3 +325,35 @@ int guac_rdp_rdpecam_capabilities_callback(guac_user* user,
 
     return 0;
 }
+
+int guac_rdp_rdpecam_debug_callback(guac_user* user,
+        const char* mimetype, const char* name, const char* value, void* data) {
+
+    guac_client* client = user ? user->client : NULL;
+
+    if (!client || !value)
+        return 0;
+
+    if (!name || strcmp(name, GUAC_RDPECAM_ARG_DEBUG) != 0)
+        return 0;
+
+    if (mimetype && strcmp(mimetype, "text/plain") != 0)
+        return 0;
+
+    char sanitized[1025];
+    size_t in_len = strlen(value);
+    size_t out_len = (in_len < sizeof(sanitized) - 1) ? in_len : (sizeof(sanitized) - 1);
+
+    for (size_t i = 0; i < out_len; i++) {
+        char c = value[i];
+        sanitized[i] = (c == '\r' || c == '\n') ? ' ' : c;
+    }
+    sanitized[out_len] = '\0';
+
+    guac_client_log(client, GUAC_LOG_DEBUG,
+            "RDPECAM browser debug: %s%s",
+            sanitized,
+            (in_len > out_len) ? " [truncated]" : "");
+
+    return 0;
+}

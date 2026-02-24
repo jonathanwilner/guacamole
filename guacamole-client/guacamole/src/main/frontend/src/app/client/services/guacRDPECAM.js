@@ -36,6 +36,10 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
      * @type String
      */
     const RDPECAM_MIMETYPE = 'application/rdpecam+h264';
+    const RDPECAM_DEBUG_ARG_NAME = 'rdpecam-debug';
+    const DEVICE_ENUMERATION_DEBOUNCE_MS = 350;
+    const RDPECAM_DEBUG_PAYLOAD_LIMIT = 1800;
+    const CAMERA_RESTART_GRACE_MS = 250;
 
     /**
      * Default camera constraints for RDPECAM.
@@ -47,8 +51,8 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     const DEFAULT_CONSTRAINTS = { width: 640, height: 480, frameRate: 15 };
 
     const CAPABILITY_CANDIDATES = [
-        { width: 640,  height: 480,  fps: [30, 15] },
-        { width: 320,  height: 240,  fps: [30, 15] },
+        { width: 640,  height: 480,  fps: [15, 30] },
+        { width: 320,  height: 240,  fps: [15, 30] },
         { width: 1280, height: 720,  fps: [30]      },
         { width: 1920, height: 1080, fps: [30]      }
     ];
@@ -93,6 +97,10 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     var deviceChangeListenerClientId = null;
     var previousOnDeviceChangeHandler = null;
     var deviceChangeHandlerUsesAddEventListener = false;
+    var deviceEnumerationTimer = null;
+    var deviceEnumerationInFlight = false;
+    var pendingEnumerationClient = null;
+    var activeDebugHookClientId = null;
 
     /**
      * Callbacks to notify when camera registry changes (for UI updates).
@@ -131,6 +139,200 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
         id = 'local-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
         clientIds.set(client, id);
         return id;
+    }
+
+    /**
+     * Returns whether any camera stream is currently active for any managed
+     * client.
+     *
+     * @returns {boolean}
+     *     true if any camera stream is active, false otherwise.
+     *
+     * @private
+     */
+    function isAnyCameraCaptureActive() {
+        if (!cameraStates)
+            return false;
+
+        return Object.keys(cameraStates).some(function(clientId) {
+            return !!(cameraStates[clientId] && cameraStates[clientId].active);
+        });
+    }
+
+    /**
+     * Sends a browser-side RDPECAM diagnostic payload to guacd through argv.
+     *
+     * @param {Guacamole.Client} client
+     *     The Guacamole client associated with the telemetry event.
+     *
+     * @param {string} eventName
+     *     Short event name for the diagnostic event.
+     *
+     * @param {Object} payload
+     *     Event payload object.
+     *
+     * @private
+     */
+    function sendRDPECAMDebugTelemetry(client, eventName, payload) {
+        if (!client || typeof client.createArgumentValueStream !== 'function')
+            return;
+
+        try {
+            var envelope = {
+                ts: new Date().toISOString(),
+                event: eventName || 'unknown',
+                payload: payload || {}
+            };
+
+            var message = JSON.stringify(envelope);
+            if (message.length > RDPECAM_DEBUG_PAYLOAD_LIMIT)
+                message = message.substring(0, RDPECAM_DEBUG_PAYLOAD_LIMIT) + '...';
+
+            var stream = client.createArgumentValueStream('text/plain', RDPECAM_DEBUG_ARG_NAME);
+            var writer = new Guacamole.StringWriter(stream);
+            writer.sendText(message);
+            writer.sendEnd();
+        }
+        catch (e) {
+            // Best-effort diagnostics only.
+        }
+    }
+
+    /**
+     * Installs a global debug hook consumed by CameraRecorder.js so browser
+     * camera/encoder events can be forwarded to guacd logs.
+     *
+     * @param {Guacamole.Client} client
+     *     The active Guacamole client.
+     *
+     * @private
+     */
+    function installCameraDebugHook(client) {
+        if (typeof window === 'undefined')
+            return;
+
+        var clientId = getLocalClientId(client);
+        if (!clientId)
+            return;
+
+        activeDebugHookClientId = clientId;
+
+        window.GUAC_RDPECAM_DEBUG_HOOK = function(eventName, payload) {
+            if (activeDebugHookClientId !== clientId)
+                return;
+            sendRDPECAMDebugTelemetry(client, eventName, payload);
+        };
+    }
+
+    /**
+     * Clears the global CameraRecorder debug hook if currently owned by the
+     * given client.
+     *
+     * @param {Guacamole.Client} client
+     *     The client whose hook ownership should be cleared.
+     *
+     * @private
+     */
+    function clearCameraDebugHook(client) {
+        if (typeof window === 'undefined')
+            return;
+
+        var clientId = getLocalClientId(client);
+        if (!clientId || activeDebugHookClientId !== clientId)
+            return;
+
+        activeDebugHookClientId = null;
+        window.GUAC_RDPECAM_DEBUG_HOOK = null;
+    }
+
+    /**
+     * Returns a normalized, comparable constraint descriptor.
+     *
+     * @param {Object} constraints
+     *     Raw constraints object.
+     *
+     * @returns {{width:number,height:number,frameRate:number,deviceId:string|null}}
+     *     Normalized constraints.
+     *
+     * @private
+     */
+    function normalizeComparableConstraints(constraints) {
+        var c = constraints || {};
+        var width = Number(c.width);
+        var height = Number(c.height);
+        var frameRate = Number(c.frameRate);
+
+        if (!isFinite(width) || width <= 0)
+            width = DEFAULT_CONSTRAINTS.width;
+        if (!isFinite(height) || height <= 0)
+            height = DEFAULT_CONSTRAINTS.height;
+        if (!isFinite(frameRate) || frameRate <= 0)
+            frameRate = DEFAULT_CONSTRAINTS.frameRate;
+
+        return {
+            width: Math.round(width),
+            height: Math.round(height),
+            frameRate: frameRate,
+            deviceId: c.deviceId || null
+        };
+    }
+
+    /**
+     * Returns whether two constraint descriptors are equivalent for purposes of
+     * reusing an active camera stream.
+     *
+     * @param {Object} left
+     *     First constraint descriptor.
+     *
+     * @param {Object} right
+     *     Second constraint descriptor.
+     *
+     * @returns {boolean}
+     *     true if the constraints are equivalent, false otherwise.
+     *
+     * @private
+     */
+    function constraintsEquivalent(left, right) {
+        if (!left || !right)
+            return false;
+
+        var a = normalizeComparableConstraints(left);
+        var b = normalizeComparableConstraints(right);
+
+        return a.width === b.width
+            && a.height === b.height
+            && Math.abs(a.frameRate - b.frameRate) < 0.01
+            && a.deviceId === b.deviceId;
+    }
+
+    /**
+     * Schedules a camera enumeration run, debouncing bursts of devicechange
+     * events and ensuring the most recent client context is used.
+     *
+     * @param {Guacamole.Client} client
+     *     The Guacamole client for which enumeration should run.
+     *
+     * @param {boolean} immediate
+     *     true to run without debounce delay.
+     *
+     * @private
+     */
+    function scheduleCameraEnumeration(client, immediate) {
+        if (!client)
+            return;
+
+        currentClient = client;
+
+        if (deviceEnumerationTimer) {
+            clearTimeout(deviceEnumerationTimer);
+            deviceEnumerationTimer = null;
+        }
+
+        var delay = immediate ? 0 : DEVICE_ENUMERATION_DEBOUNCE_MS;
+        deviceEnumerationTimer = setTimeout(function() {
+            deviceEnumerationTimer = null;
+            enumerateAndUpdateCameras(client);
+        }, delay);
     }
 
     /**
@@ -196,7 +398,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
         if (typeof navigator.mediaDevices.addEventListener === 'function') {
             deviceChangeHandler = function() {
                 if (currentClient)
-                    enumerateAndUpdateCameras(currentClient);
+                    scheduleCameraEnumeration(currentClient, false);
             };
             navigator.mediaDevices.addEventListener('devicechange', deviceChangeHandler);
             deviceChangeHandlerUsesAddEventListener = true;
@@ -208,7 +410,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                 if (typeof previousOnDeviceChangeHandler === 'function')
                     previousOnDeviceChangeHandler.call(this, event);
                 if (currentClient)
-                    enumerateAndUpdateCameras(currentClient);
+                    scheduleCameraEnumeration(currentClient, false);
             };
             navigator.mediaDevices.ondevicechange = deviceChangeHandler;
             deviceChangeHandlerUsesAddEventListener = false;
@@ -221,6 +423,11 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
      */
     function resetDeviceChangeHandler() {
         unregisterDeviceChangeHandler();
+        if (deviceEnumerationTimer) {
+            clearTimeout(deviceEnumerationTimer);
+            deviceEnumerationTimer = null;
+        }
+        pendingEnumerationClient = null;
     }
 
     /**
@@ -560,6 +767,150 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
 
     }
 
+    /**
+     * Builds capability descriptors for the given device list without opening
+     * any camera streams. Existing cached formats are preferred, otherwise a
+     * conservative default format list is used.
+     *
+     * @param {Array.<MediaDeviceInfo>} videoDevices
+     *     Enumerated video input devices.
+     *
+     * @returns {Array.<{deviceId:string,deviceName:string,formats:Array}>}
+     *     Capability descriptors suitable for applyEnumeratedCapabilities().
+     *
+     * @private
+     */
+    function buildCapabilitiesWithoutProbing(videoDevices) {
+        return videoDevices.map(function(deviceInfo) {
+            var existing = cameraRegistry[deviceInfo.deviceId];
+            var cachedFormats = existing && Array.isArray(existing.formats) ? existing.formats : null;
+
+            return {
+                deviceId: deviceInfo.deviceId,
+                deviceName: deviceInfo.label || (existing ? existing.label : ''),
+                formats: (cachedFormats && cachedFormats.length)
+                    ? cachedFormats
+                    : deriveFormatsFromCapabilities({})
+            };
+        }).filter(function(device) {
+            return device && device.deviceId && device.deviceId.trim() && device.formats && device.formats.length > 0;
+        });
+    }
+
+    /**
+     * Applies a set of per-device capabilities to the registry, persists user
+     * enablement preferences, and advertises enabled cameras to the server.
+     *
+     * @param {Guacamole.Client} client
+     *     The active Guacamole client.
+     *
+     * @param {Array.<{deviceId:string,deviceName:string,formats:Array}>} validDevices
+     *     Parsed/derived capability descriptors.
+     *
+     * @private
+     */
+    function applyEnumeratedCapabilities(client, validDevices) {
+        if (!validDevices || validDevices.length === 0) {
+            cameraRegistry = {};
+            notifyRegistryChange();
+            return;
+        }
+
+        // Load saved preferences
+        var savedEnabledDevices = preferenceService.preferences.rdpecamEnabledDevices;
+        var isFirstTime = (typeof savedEnabledDevices === 'undefined' || savedEnabledDevices === null);
+
+        // If not first time, ensure it's an array
+        if (!isFirstTime && !Array.isArray(savedEnabledDevices)) {
+            savedEnabledDevices = [];
+        }
+
+        // Some Chromium/Linux setups rotate device IDs between sessions.
+        var savedDeviceIdsStale = false;
+        var androidLikeClient = isAndroidLikeClient();
+        if (!isFirstTime && Array.isArray(savedEnabledDevices) && savedEnabledDevices.length > 0) {
+            var hasSavedMatch = validDevices.some(function(device) {
+                return savedEnabledDevices.indexOf(device.deviceId) !== -1;
+            });
+            savedDeviceIdsStale = !hasSavedMatch;
+        }
+
+        if (savedDeviceIdsStale) {
+            console.warn('RDPECAM detected stale camera device IDs in preferences; enabling newly discovered cameras.');
+        }
+
+        // Build new registry
+        var newRegistry = {};
+        var deviceIdsChanged = false;
+
+        validDevices.forEach(function(device) {
+            var wasInRegistry = cameraRegistry.hasOwnProperty(device.deviceId);
+            var wasEnabled = wasInRegistry ? cameraRegistry[device.deviceId].enabled : false;
+
+            // Determine enabled state
+            var enabled;
+            if (isFirstTime) {
+                enabled = true;
+            } else if (wasInRegistry) {
+                enabled = wasEnabled;
+            } else if (savedEnabledDevices.indexOf(device.deviceId) !== -1) {
+                enabled = true;
+            } else if (savedDeviceIdsStale) {
+                enabled = true;
+            } else {
+                enabled = false;
+            }
+
+            newRegistry[device.deviceId] = {
+                deviceId: device.deviceId,
+                label: device.deviceName,
+                enabled: enabled,
+                isActive: wasInRegistry ? cameraRegistry[device.deviceId].isActive : false,
+                formats: device.formats
+            };
+
+            if (!wasInRegistry || wasEnabled !== enabled) {
+                deviceIdsChanged = true;
+            }
+        });
+
+        // Mobile Chrome/HarmonyOS can rotate device IDs and redact metadata.
+        if (androidLikeClient) {
+            var anyEnabled = Object.keys(newRegistry).some(function(deviceId) {
+                return !!newRegistry[deviceId].enabled;
+            });
+
+            if (!anyEnabled) {
+                Object.keys(newRegistry).forEach(function(deviceId) {
+                    newRegistry[deviceId].enabled = true;
+                });
+                deviceIdsChanged = true;
+            }
+        }
+
+        // Check for removed devices
+        Object.keys(cameraRegistry).forEach(function(deviceId) {
+            if (!newRegistry.hasOwnProperty(deviceId)) {
+                deviceIdsChanged = true;
+            }
+        });
+
+        cameraRegistry = newRegistry;
+
+        // Save enabled devices if first time or if devices changed
+        if (isFirstTime || deviceIdsChanged) {
+            saveEnabledDevicesToPreferences();
+        }
+
+        // Send capabilities for enabled cameras only
+        var enabledCameras = getEnabledCameras();
+        if (enabledCameras.length > 0) {
+            sendCapabilities(client, enabledCameras);
+        }
+
+        notifyRegistryChange();
+    }
+
     function prefetchCapabilities(client) {
         if (typeof navigator === 'undefined' || !navigator.mediaDevices)
             return;
@@ -576,7 +927,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
         registerDeviceChangeHandler(client);
 
         // Initial enumeration
-        enumerateAndUpdateCameras(client);
+        scheduleCameraEnumeration(client, true);
     }
 
     /**
@@ -591,6 +942,17 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
         if (typeof navigator.mediaDevices.enumerateDevices !== 'function')
             return;
 
+        var targetClient = client || currentClient;
+        if (!targetClient)
+            return;
+
+        if (deviceEnumerationInFlight) {
+            pendingEnumerationClient = targetClient;
+            return;
+        }
+
+        deviceEnumerationInFlight = true;
+
         navigator.mediaDevices.enumerateDevices()
             .then(function(devices) {
                 var videoDevices = devices.filter(function(device) {
@@ -598,7 +960,6 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                 });
 
                 if (videoDevices.length === 0) {
-                    // No cameras detected, clear registry
                     cameraRegistry = {};
                     notifyRegistryChange();
                     return;
@@ -608,17 +969,31 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                     return device.deviceId && device.deviceId.trim().length > 0;
                 });
 
+                var captureActive = isAnyCameraCaptureActive();
+
+                // Avoid opening camera probes while any stream is active. Some
+                // Linux Chrome stacks treat probes as competing camera users.
+                if (captureActive) {
+                    if (!hasUsableDeviceIds) {
+                        console.warn('RDPECAM skipping camera re-enumeration with redacted device IDs while capture is active.');
+                        return;
+                    }
+
+                    var conservativeCapabilities = buildCapabilitiesWithoutProbing(videoDevices);
+                    applyEnumeratedCapabilities(targetClient, conservativeCapabilities);
+                    return;
+                }
+
                 // If browsers redact device IDs prior to permission being granted,
-                // request access once and retry enumeration so that prompting occurs.
+                // request access once and schedule a fresh enumeration.
                 if (!hasUsableDeviceIds) {
-                    requestCameraPermission().then(function() {
-                        enumerateAndUpdateCameras(client);
+                    return requestCameraPermission().then(function() {
+                        scheduleCameraEnumeration(targetClient, true);
                     }).catch(function(error) {
                         console.error('Camera permission request failed:', error);
                         cameraRegistry = {};
                         notifyRegistryChange();
                     });
-                    return;
                 }
 
                 // Probe capabilities sequentially. Some Linux camera drivers
@@ -648,133 +1023,28 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                     });
                 }, Promise.resolve());
 
-                probeSequentially.then(function() {
-                    // Filter out devices with no capabilities or no device ID
+                return probeSequentially.then(function() {
                     var validDevices = deviceCapabilities.filter(function(dev) {
                         return dev && dev.deviceId && dev.deviceId.trim() && dev.formats && dev.formats.length > 0;
                     });
 
-                    if (validDevices.length === 0) {
-                        cameraRegistry = {};
-                        notifyRegistryChange();
-                        return;
-                    }
-
-                    // Load saved preferences
-                    var savedEnabledDevices = preferenceService.preferences.rdpecamEnabledDevices;
-                    var isFirstTime = (typeof savedEnabledDevices === 'undefined' || savedEnabledDevices === null);
-
-                    // If not first time, ensure it's an array
-                    if (!isFirstTime && !Array.isArray(savedEnabledDevices)) {
-                        savedEnabledDevices = [];
-                    }
-
-                    // Some Chromium/Linux setups rotate device IDs between
-                    // sessions. If none of the saved IDs match current IDs,
-                    // treat cameras as newly discovered and enable them.
-                    var savedDeviceIdsStale = false;
-                    var androidLikeClient = isAndroidLikeClient();
-                    if (!isFirstTime && Array.isArray(savedEnabledDevices) && savedEnabledDevices.length > 0) {
-                        var hasSavedMatch = validDevices.some(function(device) {
-                            return savedEnabledDevices.indexOf(device.deviceId) !== -1;
-                        });
-                        savedDeviceIdsStale = !hasSavedMatch;
-                    }
-
-                    if (savedDeviceIdsStale) {
-                        console.warn('RDPECAM detected stale camera device IDs in preferences; enabling newly discovered cameras.');
-                    }
-
-                    // Build new registry
-                    var newRegistry = {};
-                    var deviceIdsChanged = false;
-
-                    validDevices.forEach(function(device) {
-                        var wasInRegistry = cameraRegistry.hasOwnProperty(device.deviceId);
-                        var wasEnabled = wasInRegistry ? cameraRegistry[device.deviceId].enabled : false;
-
-                        // Determine enabled state
-                        var enabled;
-                        if (isFirstTime) {
-                            // First time (preference never set): enable all cameras by default
-                            enabled = true;
-                        } else if (wasInRegistry) {
-                            // Keep existing enabled state from current session
-                            enabled = wasEnabled;
-                        } else if (savedEnabledDevices.indexOf(device.deviceId) !== -1) {
-                            // New camera that user previously enabled
-                            enabled = true;
-                        } else if (savedDeviceIdsStale) {
-                            // Device IDs rotated; recover by enabling discovered devices
-                            enabled = true;
-                        } else {
-                            // New camera or user disabled it: default to disabled
-                            enabled = false;
-                        }
-
-                        newRegistry[device.deviceId] = {
-                            deviceId: device.deviceId,
-                            label: device.deviceName,
-                            enabled: enabled,
-                            isActive: wasInRegistry ? cameraRegistry[device.deviceId].isActive : false,
-                            formats: device.formats
-                        };
-
-                        if (!wasInRegistry || wasEnabled !== enabled) {
-                            deviceIdsChanged = true;
-                        }
-                    });
-
-                    // Mobile Chrome/HarmonyOS can rotate device IDs and redact
-                    // metadata aggressively. If nothing is enabled, recover by
-                    // enabling discovered cameras so capabilities are still sent.
-                    if (androidLikeClient) {
-                        var anyEnabled = Object.keys(newRegistry).some(function(deviceId) {
-                            return !!newRegistry[deviceId].enabled;
-                        });
-
-                        if (!anyEnabled) {
-                            Object.keys(newRegistry).forEach(function(deviceId) {
-                                newRegistry[deviceId].enabled = true;
-                            });
-                            deviceIdsChanged = true;
-                        }
-                    }
-
-                    // Check for removed devices
-                    Object.keys(cameraRegistry).forEach(function(deviceId) {
-                        if (!newRegistry.hasOwnProperty(deviceId)) {
-                            deviceIdsChanged = true;
-                        }
-                    });
-
-                    cameraRegistry = newRegistry;
-
-                    // Save enabled devices if first time or if devices changed
-                    if (isFirstTime || deviceIdsChanged) {
-                        saveEnabledDevicesToPreferences();
-                    }
-
-                    // Send capabilities for enabled cameras only
-                    var enabledCameras = getEnabledCameras();
-                    if (enabledCameras.length > 0) {
-                        sendCapabilities(client, enabledCameras);
-                    }
-
-                    // Notify UI
-                    notifyRegistryChange();
-
+                    applyEnumeratedCapabilities(targetClient, validDevices);
                 }).catch(function(error) {
-                    // Error probing device capabilities - log error and clear registry
                     console.error('Error probing camera capabilities:', error);
                     cameraRegistry = {};
                     notifyRegistryChange();
                 });
             }).catch(function(error) {
-                // Error enumerating devices - log error and clear registry
                 console.error('Error enumerating camera devices:', error);
                 cameraRegistry = {};
                 notifyRegistryChange();
+            }).finally(function() {
+                deviceEnumerationInFlight = false;
+                if (pendingEnumerationClient) {
+                    var queuedClient = pendingEnumerationClient;
+                    pendingEnumerationClient = null;
+                    scheduleCameraEnumeration(queuedClient, false);
+                }
             });
     }
 
@@ -901,9 +1171,40 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                 // Ensure single recorder per client: stop any existing one first
                 var existingClientId = getLocalClientId(client);
                 if (existingClientId && (cameraControllers[existingClientId] || cameraRecorders[existingClientId])) {
+                    var existingState = cameraStates[existingClientId] || null;
+                    var existingConstraints = existingState ? existingState.activeConstraints : null;
+                    var canReuse = !!cameraRecorders[existingClientId]
+                        && constraintsEquivalent(existingConstraints, constraints)
+                        && typeof cameraControllers[existingClientId] === 'function';
+
+                    if (canReuse) {
+                        sendRDPECAMDebugTelemetry(client, 'camera-start-reusing-existing', {
+                            width: constraints.width,
+                            height: constraints.height,
+                            frameRate: constraints.frameRate,
+                            deviceId: constraints.deviceId || null
+                        });
+
+                        resolve({
+                            stop: cameraControllers[existingClientId]
+                        });
+                        return;
+                    }
+
                     try {
                         stopCamera(client);
                     } catch (ignore) {}
+
+                    if (isLinuxDesktopClient() || isAndroidLikeClient()) {
+                        sendRDPECAMDebugTelemetry(client, 'camera-start-restart-delayed', {
+                            delayMs: CAMERA_RESTART_GRACE_MS
+                        });
+
+                        setTimeout(function() {
+                            startCamera(client, constraints, onState).then(resolve, reject);
+                        }, CAMERA_RESTART_GRACE_MS);
+                        return;
+                    }
                 }
 
                 // Get client ID for tracking
@@ -923,6 +1224,15 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                     reject(new Error('Camera recording not supported'));
                     return;
                 }
+
+                installCameraDebugHook(client);
+                sendRDPECAMDebugTelemetry(client, 'camera-start-requested', {
+                    width: constraints.width,
+                    height: constraints.height,
+                    frameRate: constraints.frameRate,
+                    deviceId: constraints.deviceId || null,
+                    userAgent: getUserAgentString()
+                });
 
                 // Capabilities are sent via prefetchCapabilities, which enumerates all devices.
                 // This callback may still fire, but we rely on prefetchCapabilities for the
@@ -954,9 +1264,15 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                     // Update state to inactive
                     var clientId = getLocalClientId(client);
                     if (clientId) {
-                        var deviceId = cameraStates[clientId] ? cameraStates[clientId].deviceId : null;
+                        var state = cameraStates[clientId] || null;
+                        var deviceId = state ? state.deviceId : null;
+                        if (state)
+                            state.activeConstraints = null;
                         updateCameraState(clientId, false, deviceId);
                     }
+
+                    sendRDPECAMDebugTelemetry(client, 'camera-recorder-closed', {});
+                    clearCameraDebugHook(client);
                     
                     if (onState) {
                         onState({ running: false });
@@ -967,9 +1283,15 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                     // Update state to inactive on error
                     var clientId = getLocalClientId(client);
                     if (clientId) {
-                        var deviceId = cameraStates[clientId] ? cameraStates[clientId].deviceId : null;
+                        var state = cameraStates[clientId] || null;
+                        var deviceId = state ? state.deviceId : null;
+                        if (state)
+                            state.activeConstraints = null;
                         updateCameraState(clientId, false, deviceId);
                     }
+
+                    sendRDPECAMDebugTelemetry(client, 'camera-recorder-error', {});
+                    clearCameraDebugHook(client);
                     
                     if (onState) {
                         onState({ running: false, error: true });
@@ -983,6 +1305,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                 var stopFunction = function() {
                     recorder.stop();
                     stream.sendEnd();
+                    clearCameraDebugHook(client);
                     
                     // Clean up recorder reference (state update handled by caller)
                     if (clientId && cameraRecorders[clientId]) {
@@ -1005,6 +1328,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                         cameraStates[clientId] = {};
                     }
                     cameraStates[clientId].deviceId = constraints.deviceId;
+                    cameraStates[clientId].activeConstraints = normalizeComparableConstraints(constraints);
                     
                     updateCameraState(clientId, true, constraints.deviceId);
                 }
@@ -1075,6 +1399,15 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
             frameRate: params.fpsNum / params.fpsDenom,  // Calculate actual FPS (e.g., 15/1 = 15)
             deviceId: deviceId || undefined
         };
+
+        sendRDPECAMDebugTelemetry(client, 'camera-start-params', {
+            width: constraints.width,
+            height: constraints.height,
+            fpsNum: params.fpsNum,
+            fpsDen: params.fpsDenom,
+            streamIndex: params.streamIndex,
+            deviceId: constraints.deviceId || null
+        });
 
         // Use the existing startCamera function with server-provided constraints
         // Controller is registered immediately inside startCamera, no need to do it here
@@ -1443,11 +1776,15 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
 
         // Check if camera is already stopped
         if (!cameraControllers[clientId]) {
+            if (cameraStates[clientId])
+                cameraStates[clientId].activeConstraints = null;
+            clearCameraDebugHook(client);
             return;
         }
 
         // Stop the camera for this client
         try {
+            sendRDPECAMDebugTelemetry(client, 'camera-stop-requested', {});
             cameraControllers[clientId]();
             delete cameraControllers[clientId];
             if (cameraRecorders[clientId])
@@ -1464,9 +1801,12 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
             // Clear deviceId from cameraStates
             if (cameraStates[clientId]) {
                 delete cameraStates[clientId].deviceId;
+                cameraStates[clientId].activeConstraints = null;
             }
+            clearCameraDebugHook(client);
         } catch (error) {
             // Error stopping camera - ignore
+            clearCameraDebugHook(client);
         }
 
     }

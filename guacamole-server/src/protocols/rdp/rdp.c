@@ -156,6 +156,13 @@ static BOOL rdp_freerdp_load_channels(freerdp* instance) {
                     " dynamic camera enable/disable may be limited.");
         }
 
+        if (guac_argv_register(GUAC_RDPECAM_ARG_DEBUG,
+                guac_rdp_rdpecam_debug_callback, NULL, 0)) {
+            guac_client_log(client, GUAC_LOG_WARNING,
+                    "Unable to register RDPECAM debug telemetry handler;"
+                    " browser-side camera diagnostics will be unavailable.");
+        }
+
         /* Initialize sink pointer to NULL. Each device will create its own sink.
          * When a device starts streaming, rdp_client->rdpecam_sink will be set
          * to point to that device's sink so the browser knows where to push frames. */

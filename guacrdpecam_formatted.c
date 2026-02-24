@@ -56,7 +56,7 @@
 
 #define GUAC_RDPECAM_DEFAULT_WIDTH 640u
 #define GUAC_RDPECAM_DEFAULT_HEIGHT 480u
-#define GUAC_RDPECAM_DEFAULT_FPS_NUM 15u
+#define GUAC_RDPECAM_DEFAULT_FPS_NUM 30u
 #define GUAC_RDPECAM_DEFAULT_FPS_DEN 1u
 
 /**
@@ -213,90 +213,6 @@ static void guac_rdp_rdpecam_log_stream(guac_client *client, const char *prefix,
 
   guac_rdp_rdpecam_log_message(client, prefix, channel_name, channel_id,
                                cam_msg, payload_len, payload);
-}
-
-/**
- * Appends a media type descriptor for the given camera format.
- *
- * @param media_types
- *     Destination media type array.
- *
- * @param media_type_count
- *     Pointer to current media type count, incremented on success.
- *
- * @param fmt
- *     Camera format to append.
- *
- * @return
- *     true if a media type was appended, false otherwise.
- */
-static bool guac_rdp_rdpecam_append_media_type_from_format(
-    rdpecam_media_type_desc *media_types, size_t *media_type_count,
-    const guac_rdp_rdpecam_format *fmt) {
-
-  if (!media_types || !media_type_count || !fmt)
-    return false;
-
-  if (*media_type_count >= GUAC_RDP_RDPECAM_MAX_FORMATS)
-    return false;
-
-  if (!fmt->width || !fmt->height || !fmt->fps_num)
-    return false;
-
-  media_types[(*media_type_count)++] = (rdpecam_media_type_desc){
-      .Format = CAM_MEDIA_FORMAT_H264,
-      .Width = fmt->width,
-      .Height = fmt->height,
-      .FrameRateNumerator = fmt->fps_num,
-      .FrameRateDenominator = fmt->fps_den ? fmt->fps_den : 1,
-      .PixelAspectRatioNumerator = 1,
-      .PixelAspectRatioDenominator = 1,
-      .Flags = CAM_MEDIA_TYPE_DESCRIPTION_FLAG_DecodingRequired};
-
-  return true;
-}
-
-/**
- * Chooses the preferred camera format from a device capability list.
- * Preference is given to lower effective framerate (to reduce contention on
- * Linux/mobile camera stacks), then to resolutions nearest 640x480.
- *
- * @param caps
- *     Device capability list.
- *
- * @return
- *     Pointer to preferred format within caps, or NULL if no valid format
- *     exists.
- */
-static const guac_rdp_rdpecam_format *guac_rdp_rdpecam_choose_preferred_format(
-    const guac_rdp_rdpecam_device_caps *caps) {
-
-  if (!caps || caps->format_count == 0)
-    return NULL;
-
-  const guac_rdp_rdpecam_format *best = NULL;
-  uint64_t best_fps_milli = UINT64_MAX;
-  uint64_t best_distance = UINT64_MAX;
-
-  for (unsigned int i = 0; i < caps->format_count; i++) {
-    const guac_rdp_rdpecam_format *candidate = &caps->formats[i];
-    if (!candidate->width || !candidate->height || !candidate->fps_num)
-      continue;
-
-    uint64_t den = candidate->fps_den ? candidate->fps_den : 1;
-    uint64_t fps_milli = (((uint64_t)candidate->fps_num) * 1000U) / den;
-    uint64_t distance = (uint64_t)llabs((long long)candidate->width - 640LL) +
-                        (uint64_t)llabs((long long)candidate->height - 480LL);
-
-    if (!best || fps_milli < best_fps_milli ||
-        (fps_milli == best_fps_milli && distance < best_distance)) {
-      best = candidate;
-      best_fps_milli = fps_milli;
-      best_distance = distance;
-    }
-  }
-
-  return best;
 }
 
 /* Forward declarations for device helper functions (definitions at end of file)
@@ -857,7 +773,6 @@ static void *guac_rdp_rdpecam_dequeue_thread(void *arg) {
           pthread_mutex_lock(&device->lock);
           device->streaming = false;
           device->is_active_sender = false;
-          device->stream_session_refs = 0;
           pthread_cond_broadcast(&device->credits_signal);
           pthread_mutex_unlock(&device->lock);
           pthread_mutex_lock(&sink->lock);
@@ -1151,7 +1066,6 @@ static UINT guac_rdp_rdpecam_handle_data(
       device->credits = 0;
       device->streaming = false;
       device->is_active_sender = false;
-      device->stream_session_refs = 0;
       pthread_cond_broadcast(&device->credits_signal);
       pthread_mutex_unlock(&device->lock);
 
@@ -1268,7 +1182,7 @@ static UINT guac_rdp_rdpecam_handle_data(
                                       CAM_STREAM_FRAME_SOURCE_TYPE_Color,
                                   .Category = CAM_STREAM_CATEGORY_Capture,
                                   .Selected = 1,
-                                  .CanBeShared = 1};
+                                  .CanBeShared = 0};
     rs = Stream_New(NULL, 16);
     if (rs && rdpecam_build_stream_list(rs, &stream, 1)) {
       Stream_SealLength(rs);
@@ -1321,22 +1235,22 @@ static UINT guac_rdp_rdpecam_handle_data(
     }
 
     if (caps && caps->format_count > 0) {
-      /* Put the safest/preferred format first for better client interoperability. */
-      const guac_rdp_rdpecam_format *preferred =
-          guac_rdp_rdpecam_choose_preferred_format(caps);
-      if (preferred)
-        guac_rdp_rdpecam_append_media_type_from_format(
-            media_types, &media_type_count, preferred);
-
-      for (unsigned int i = 0; i < caps->format_count; i++) {
+      /* Use formats from this device's capabilities */
+      for (unsigned int i = 0; i < caps->format_count &&
+                               media_type_count < GUAC_RDP_RDPECAM_MAX_FORMATS;
+           i++) {
         guac_rdp_rdpecam_format *fmt = &caps->formats[i];
-        if (fmt == preferred)
+        if (!fmt->width || !fmt->height || !fmt->fps_num)
           continue;
-        if (!guac_rdp_rdpecam_append_media_type_from_format(
-                media_types, &media_type_count, fmt))
-          continue;
-        if (media_type_count >= GUAC_RDP_RDPECAM_MAX_FORMATS)
-          break;
+        media_types[media_type_count++] = (rdpecam_media_type_desc){
+            .Format = CAM_MEDIA_FORMAT_H264,
+            .Width = fmt->width,
+            .Height = fmt->height,
+            .FrameRateNumerator = fmt->fps_num,
+            .FrameRateDenominator = fmt->fps_den ? fmt->fps_den : 1,
+            .PixelAspectRatioNumerator = 1,
+            .PixelAspectRatioDenominator = 1,
+            .Flags = CAM_MEDIA_TYPE_DESCRIPTION_FLAG_DecodingRequired};
       }
     }
     guac_rwlock_release_lock(&(rdp_client->lock));
@@ -1412,11 +1326,8 @@ static UINT guac_rdp_rdpecam_handle_data(
         }
 
         if (caps && caps->format_count > 0) {
-          /* Use the preferred/safest format from this device's capabilities. */
-          const guac_rdp_rdpecam_format *preferred =
-              guac_rdp_rdpecam_choose_preferred_format(caps);
-          if (!preferred)
-            preferred = &caps->formats[0];
+          /* Use first format from this device's capabilities */
+          guac_rdp_rdpecam_format *preferred = &caps->formats[0];
           media_type = (rdpecam_media_type_desc){
               .Format = CAM_MEDIA_FORMAT_H264,
               .Width = preferred->width,
@@ -1491,86 +1402,6 @@ static UINT guac_rdp_rdpecam_handle_data(
     Stream_Read_UINT32(stream, media_type.PixelAspectRatioDenominator);
     Stream_Read_UINT8(stream, media_type.Flags);
 
-    /* Browser capture constraints can be stricter than what Windows requests.
-     * Keep protocol/media_type intact for RDP state, but clamp the browser
-     * camera-start signal to the preferred device FPS when needed. */
-    rdpecam_media_type_desc browser_media_type = media_type;
-    guac_rwlock_acquire_read_lock(&(rdp_client->lock));
-    guac_rdp_rdpecam_device_caps *start_caps = NULL;
-    if (ch_name)
-      start_caps = guac_rdp_rdpecam_get_device_caps(rdp_client, ch_name);
-    if (start_caps && start_caps->format_count > 0) {
-      const guac_rdp_rdpecam_format *preferred =
-          guac_rdp_rdpecam_choose_preferred_format(start_caps);
-      if (preferred) {
-        uint32_t preferred_num = preferred->fps_num;
-        uint32_t preferred_den = preferred->fps_den ? preferred->fps_den : 1;
-        uint32_t requested_num = browser_media_type.FrameRateNumerator;
-        uint32_t requested_den =
-            browser_media_type.FrameRateDenominator
-                ? browser_media_type.FrameRateDenominator
-                : 1;
-
-        if (requested_num == 0 ||
-            ((uint64_t)requested_num * (uint64_t)preferred_den >
-             (uint64_t)preferred_num * (uint64_t)requested_den)) {
-          browser_media_type.FrameRateNumerator = preferred_num;
-          browser_media_type.FrameRateDenominator = preferred_den;
-          guac_client_log(client, GUAC_LOG_DEBUG,
-                          "RDPECAM clamping browser camera-start FPS from "
-                          "%u/%u to preferred %u/%u on %s[id=%" PRIu32 "]",
-                          requested_num, requested_den, preferred_num,
-                          preferred_den, ch_name, channel_id);
-        }
-      }
-    }
-    guac_rwlock_release_lock(&(rdp_client->lock));
-
-    if (stream_idx == 0) {
-      bool already_streaming = false;
-      uint32_t stream_session_refs = 0;
-
-      pthread_mutex_lock(&device->lock);
-      if (device->streaming && device->stream_index == stream_idx) {
-        device->stream_session_refs++;
-        stream_session_refs = device->stream_session_refs;
-        if (!device->stream_channel)
-          device->stream_channel = channel;
-        device->stream_channel_id = channel_id;
-        pthread_cond_broadcast(&device->credits_signal);
-        already_streaming = true;
-      }
-      pthread_mutex_unlock(&device->lock);
-
-      if (already_streaming) {
-        rdpecam_channel_callback->is_stream_channel = true;
-
-        if (rdp_client->rdpecam_sink != device->sink)
-          rdp_client->rdpecam_sink = device->sink;
-
-        guac_client_log(client, GUAC_LOG_DEBUG,
-                        "RDPECAM StartStreams idempotent reuse for %s "
-                        "(stream=%u, refs=%" PRIu32 ")",
-                        device->device_name, stream_idx, stream_session_refs);
-
-        rs = Stream_New(NULL, 8);
-        if (rs && rdpecam_build_start_streams_response(rs, 0)) {
-          Stream_SealLength(rs);
-          const size_t out_len = Stream_Length(rs);
-          guac_rdp_rdpecam_log_stream(client, "TX", ch_name, channel_id, rs);
-          pthread_mutex_lock(&(rdp_client->message_lock));
-          result =
-              channel->Write(channel, (UINT32)out_len, Stream_Buffer(rs), NULL);
-          pthread_mutex_unlock(&(rdp_client->message_lock));
-          guac_client_log(client, GUAC_LOG_DEBUG,
-                          "RDPECAM TX ChannelId=%" PRIu32
-                          " MessageId=0x01 SuccessResponse (StartStreams reuse)",
-                          channel_id);
-        }
-        break;
-      }
-    }
-
     /* Handle camera switching: if another device is currently streaming,
      * stop it before starting this device (single-camera model).
      * Windows doesn't explicitly stop the old camera before starting the new
@@ -1602,7 +1433,6 @@ static UINT guac_rdp_rdpecam_handle_data(
             old_device->streaming = false;
             old_device->is_active_sender = false;
             old_device->credits = 0;
-            old_device->stream_session_refs = 0;
             old_device->stream_channel = NULL;
             old_device->stream_channel_id = 0;
             pthread_cond_broadcast(&old_device->credits_signal);
@@ -1650,7 +1480,6 @@ static UINT guac_rdp_rdpecam_handle_data(
       device->credits = 0;
       device->streaming = true;
       device->is_active_sender = true;
-      device->stream_session_refs = 1;
       device->stopping = false;
       device->stream_channel = channel;
       device->stream_channel_id = channel_id;
@@ -1721,10 +1550,10 @@ static UINT guac_rdp_rdpecam_handle_data(
 
         if (result == CHANNEL_RC_OK) {
           guac_rdp_camera_start_params camera_params = {
-              .width = browser_media_type.Width,
-              .height = browser_media_type.Height,
-              .fps_numerator = browser_media_type.FrameRateNumerator,
-              .fps_denominator = browser_media_type.FrameRateDenominator,
+              .width = media_type.Width,
+              .height = media_type.Height,
+              .fps_numerator = media_type.FrameRateNumerator,
+              .fps_denominator = media_type.FrameRateDenominator,
               .stream_index = stream_idx,
               .device_id = device ? device->browser_device_id : NULL};
 
@@ -1735,9 +1564,9 @@ static UINT guac_rdp_rdpecam_handle_data(
           guac_client_log(client, GUAC_LOG_DEBUG,
                           "RDPECAM sent camera-start signal to JavaScript: "
                           "width=%u, height=%u, fps=%u/%u, stream_index=%u",
-                          browser_media_type.Width, browser_media_type.Height,
-                          browser_media_type.FrameRateNumerator,
-                          browser_media_type.FrameRateDenominator, stream_idx);
+                          media_type.Width, media_type.Height,
+                          media_type.FrameRateNumerator,
+                          media_type.FrameRateDenominator, stream_idx);
         }
       }
     }
@@ -1755,7 +1584,6 @@ static UINT guac_rdp_rdpecam_handle_data(
 
     uint32_t outstanding = 0;
     uint32_t stream_index = 0;
-    uint32_t remaining_stream_refs = 0;
 
     pthread_mutex_lock(&device->lock);
     if (!device->stream_channel) {
@@ -1763,42 +1591,13 @@ static UINT guac_rdp_rdpecam_handle_data(
       pthread_cond_broadcast(&device->credits_signal);
     }
     rdpecam_channel_callback->is_stream_channel = true;
+    outstanding = device->credits;
     stream_index = device->stream_index;
-    if (device->stream_session_refs > 0)
-      device->stream_session_refs--;
-    remaining_stream_refs = device->stream_session_refs;
-
-    if (remaining_stream_refs == 0) {
-      outstanding = device->credits;
-      device->credits = 0;
-      device->streaming = false;
-      device->is_active_sender = false;
-    }
+    device->credits = 0;
+    device->streaming = false;
+    device->is_active_sender = false;
     pthread_cond_broadcast(&device->credits_signal);
     pthread_mutex_unlock(&device->lock);
-
-    if (remaining_stream_refs > 0) {
-      guac_client_log(client, GUAC_LOG_DEBUG,
-                      "RDPECAM StopStreams deferred teardown for %s "
-                      "(stream=%" PRIu32 ", refs=%" PRIu32 ")",
-                      device->device_name, stream_index, remaining_stream_refs);
-
-      rs = Stream_New(NULL, 8);
-      if (rs && rdpecam_build_stop_streams_response(rs, /*status*/ 0)) {
-        Stream_SealLength(rs);
-        const size_t out_len = Stream_Length(rs);
-        guac_rdp_rdpecam_log_stream(client, "TX", ch_name, channel_id, rs);
-        pthread_mutex_lock(&(rdp_client->message_lock));
-        result =
-            channel->Write(channel, (UINT32)out_len, Stream_Buffer(rs), NULL);
-        pthread_mutex_unlock(&(rdp_client->message_lock));
-        guac_client_log(client, GUAC_LOG_DEBUG,
-                        "RDPECAM TX ChannelId=%" PRIu32
-                        " MessageId=0x01 SuccessResponse (StopStreams deferred)",
-                        channel_id);
-      }
-      break;
-    }
 
     guac_rdpecam_request_keyframe(device->sink);
 
@@ -1960,25 +1759,25 @@ static UINT guac_rdp_rdpecam_handle_data(
 
   if (rs)
     Stream_Free(rs, TRUE);
+}
 
-  /* Check if capabilities were updated while we were processing messages.
-   * This handles the case where capabilities arrive after version negotiation.
-   */
-  if (plugin && plugin->version_negotiated && plugin->enumerator_channel) {
-    guac_rwlock_acquire_write_lock(&(rdp_client->lock));
-    if (rdp_client->rdpecam_caps_updated &&
-        rdp_client->rdpecam_device_caps_count > 0) {
-      guac_rdp_rdpecam_send_device_notifications(plugin, client, rdp_client,
-                                                 plugin->enumerator_channel);
-      rdp_client->rdpecam_caps_updated = 0; /* Clear the flag */
-      guac_client_log(
-          client, GUAC_LOG_DEBUG,
-          "RDPECAM sent device notifications after late capability update");
-    }
-    guac_rwlock_release_lock(&(rdp_client->lock));
+/* Check if capabilities were updated while we were processing messages.
+ * This handles the case where capabilities arrive after version negotiation. */
+if (plugin && plugin->version_negotiated && plugin->enumerator_channel) {
+  guac_rwlock_acquire_write_lock(&(rdp_client->lock));
+  if (rdp_client->rdpecam_caps_updated &&
+      rdp_client->rdpecam_device_caps_count > 0) {
+    guac_rdp_rdpecam_send_device_notifications(plugin, client, rdp_client,
+                                               plugin->enumerator_channel);
+    rdp_client->rdpecam_caps_updated = 0; /* Clear the flag */
+    guac_client_log(
+        client, GUAC_LOG_DEBUG,
+        "RDPECAM sent device notifications after late capability update");
   }
+  guac_rwlock_release_lock(&(rdp_client->lock));
+}
 
-  return CHANNEL_RC_OK;
+return CHANNEL_RC_OK;
 }
 
 /**
@@ -2131,7 +1930,6 @@ guac_rdp_rdpecam_close(IWTSVirtualChannelCallback *channel_callback) {
       device->stream_channel = NULL;
       device->is_active_sender = false;
       device->streaming = false;
-      device->stream_session_refs = 0;
       pthread_cond_broadcast(&device->credits_signal);
     }
 
@@ -2323,6 +2121,7 @@ static UINT guac_rdp_rdpecam_new_connection(
 
   /* Messages will be sent in OnOpen callback, not here */
   return CHANNEL_RC_OK;
+}
 }
 
 /**
@@ -2562,7 +2361,6 @@ guac_rdpecam_device_create(guac_rdp_rdpecam_plugin *plugin,
   device->sample_sequence = 0;
   device->is_active_sender = false;
   device->streaming = false;
-  device->stream_session_refs = 0;
   device->stopping = false;
   device->ref_count = 1;
 
@@ -2726,6 +2524,7 @@ static BOOL guac_rdp_rdpecam_mapping_add(guac_rdp_rdpecam_plugin *plugin,
   plugin->device_id_mappings = entry;
   return TRUE;
 }
+}
 
 /**
  * Clears all device ID mappings, releasing any allocated memory.
@@ -2753,333 +2552,6 @@ static void guac_rdp_rdpecam_mapping_clear(guac_rdp_rdpecam_plugin *plugin) {
     guac_mem_free(current);
 
     current = next;
-  }
-}
-
-/**
- * Destroys an RDPECAM device structure and frees all associated resources.
- * This is called as a destructor by the hash table when devices are removed
- * or when the plugin terminates.
- *
- * @param device
- *     The device to destroy. May be NULL.
- */
-static void guac_rdpecam_device_destroy(guac_rdpecam_device *device) {
-
-  if (!device) {
-    return;
-  }
-
-  guac_client *client = device->sink ? device->sink->client : NULL;
-  guac_rdp_client *rdp_client = client ? (guac_rdp_client *)client->data : NULL;
-
-  /* Signal the dequeue thread to stop */
-  pthread_mutex_lock(&device->lock);
-  device->stopping = true;
-  pthread_cond_broadcast(&device->credits_signal);
-  pthread_mutex_unlock(&device->lock);
-
-  if (device->sink)
-    guac_rdpecam_signal_stop(device->sink);
-
-  if (device->dequeue_thread_started) {
-    int rc = pthread_join(device->dequeue_thread, NULL);
-    if (rc != 0 && client) {
-      guac_client_log(
-          client, GUAC_LOG_WARNING,
-          "RDPECAM dequeue thread join failed for device %s (rc=%d)",
-          device->device_name ? device->device_name : "unknown", rc);
-    }
-  }
-
-  /* Clean up synchronization primitives */
-  pthread_cond_destroy(&device->credits_signal);
-  pthread_mutex_destroy(&device->lock);
-
-  /* Destroy per-device sink */
-  if (device->sink) {
-    if (rdp_client && rdp_client->rdpecam_sink == device->sink)
-      rdp_client->rdpecam_sink = NULL;
-    if (client) {
-      guac_client_log(client, GUAC_LOG_DEBUG,
-                      "RDPECAM destroying sink for device: %s",
-                      device->device_name ? device->device_name : "unknown");
-    }
-    guac_rdpecam_destroy(device->sink);
-  }
-
-  /* Free browser device ID */
-  if (device->browser_device_id) {
-    guac_mem_free(device->browser_device_id);
-  }
-
-  /* Free device name */
-  if (device->device_name) {
-    guac_mem_free(device->device_name);
-  }
-
-  /* Free device structure */
-  guac_mem_free(device);
-}
-
-/**
- * Looks up a device in the plugin's device hash table.
- * Returns the device structure if found, NULL otherwise.
- *
- * @param plugin
- *     The RDPECAM plugin instance.
- *
- * @param device_name
- *     Name of the device to look up.
- *
- * @return
- *     Pointer to the device structure, or NULL if not found.
- */
-static guac_rdpecam_device *
-guac_rdpecam_device_lookup(guac_rdp_rdpecam_plugin *plugin,
-                           const char *device_name) {
-
-  if (!plugin || !device_name || !plugin->devices) {
-    return NULL;
-  }
-
-  return (guac_rdpecam_device *)HashTable_GetItemValue(plugin->devices,
-                                                       (void *)device_name);
-}
-
-/**
- * Gets device capabilities for a given channel name by extracting the device
- * index from the channel name pattern and looking up capabilities.
- *
- * WARNING: The caller MUST hold rdp_client->lock (read or write) when calling
- * this function and while using the returned pointer. The returned pointer is
- * only valid while the lock is held.
- *
- * @param rdp_client
- *     The RDP client containing device capabilities. The caller must hold
- *     rdp_client->lock.
- *
- * @param channel_name
- *     The channel name (e.g., "RDCamera_Device_0").
- *
- * @return
- *     Pointer to device capabilities if found, NULL otherwise. Valid only
- *     while rdp_client->lock is held by the caller.
- */
-static guac_rdp_rdpecam_device_caps *
-guac_rdp_rdpecam_get_device_caps(guac_rdp_client *rdp_client,
-                                 const char *channel_name) {
-
-  if (!rdp_client || !channel_name)
-    return NULL;
-
-  /* Extract device index from channel name (e.g., "RDCamera_Device_0" -> 0) */
-  unsigned int device_index = 0;
-  if (sscanf(channel_name, "RDCamera_Device_%u", &device_index) != 1)
-    return NULL;
-
-  /* Caller must hold lock - we don't acquire/release it here */
-  if (device_index < rdp_client->rdpecam_device_caps_count)
-    return &rdp_client->rdpecam_device_caps[device_index];
-
-  return NULL;
-}
-
-/**
- * Sends DeviceAddedNotification messages for all devices in capabilities.
- * This function creates device ID mappings, registers listeners for device
- * channels, and sends DeviceAddedNotification messages via the enumerator
- * channel.
- *
- * @param plugin
- *     The RDPECAM plugin instance.
- *
- * @param client
- *     The guac_client instance.
- *
- * @param rdp_client
- *     The RDP client data (must have lock held).
- *
- * @param enumerator_channel
- *     The enumerator channel to send notifications through.
- */
-void guac_rdp_rdpecam_send_device_notifications(
-    guac_rdp_rdpecam_plugin *plugin, guac_client *client,
-    guac_rdp_client *rdp_client, IWTSVirtualChannel *enumerator_channel) {
-
-  if (!plugin || !client || !rdp_client || !enumerator_channel)
-    return;
-
-  unsigned int device_count = rdp_client->rdpecam_device_caps_count;
-
-  /* If no devices are reported by the browser, advertise a single virtual
-   * camera anyway to ensure Windows sees a device. */
-  if (device_count == 0) {
-    guac_client_log(client, GUAC_LOG_DEBUG,
-                    "RDPECAM no devices reported by browser, advertising "
-                    "default virtual camera");
-
-    const char *device_id = GUAC_RDPECAM_VIRTUAL_DEVICE_ID;
-    const char *channel_name = "RDCamera_Device_0";
-    const char *device_name = "Guacamole Camera";
-
-    /* Store virtual mapping */
-    if (!guac_rdp_rdpecam_mapping_add(plugin, device_id, channel_name)) {
-      guac_client_log(client, GUAC_LOG_ERROR,
-                      "RDPECAM failed to record default device mapping");
-      return;
-    }
-
-    /* Create listener for the virtual device */
-    if (plugin->manager) {
-      guac_rdp_rdpecam_listener_callback *device_listener =
-          guac_mem_zalloc(sizeof(guac_rdp_rdpecam_listener_callback));
-      if (device_listener) {
-        char *saved_channel_name = guac_mem_alloc(strlen(channel_name) + 1);
-        if (saved_channel_name) {
-          strcpy(saved_channel_name, channel_name);
-          device_listener->client = client;
-          device_listener->channel_name = saved_channel_name;
-          device_listener->plugin = plugin;
-          device_listener->parent.OnNewChannelConnection =
-              guac_rdp_rdpecam_new_connection;
-
-          plugin->manager->CreateListener(
-              plugin->manager, channel_name, 0,
-              (IWTSListenerCallback *)device_listener, NULL);
-
-          guac_client_log(client, GUAC_LOG_DEBUG,
-                          "RDPECAM registered listener for default device "
-                          "channel: %s",
-                          channel_name);
-        } else {
-          guac_mem_free(device_listener);
-        }
-      }
-    }
-
-    /* Send DeviceAddedNotification for virtual camera */
-    wStream *rs = Stream_New(NULL, 256);
-    if (rs && rdpecam_build_device_added(rs, device_name, channel_name)) {
-      Stream_SealLength(rs);
-      const size_t out_len = Stream_Length(rs);
-
-      UINT32 enum_channel_id = 0;
-      if (plugin->manager && plugin->manager->GetChannelId)
-        enum_channel_id = plugin->manager->GetChannelId(enumerator_channel);
-
-      guac_rdp_rdpecam_log_stream(client, "TX", "RDCamera_Device_Enumerator",
-                                  enum_channel_id, rs);
-      pthread_mutex_lock(&(rdp_client->message_lock));
-      UINT result =
-          plugin->enumerator_channel->Write(plugin->enumerator_channel,
-                                            (UINT32)out_len, Stream_Buffer(rs),
-                                            NULL);
-      pthread_mutex_unlock(&(rdp_client->message_lock));
-
-      guac_client_log(
-          client, GUAC_LOG_DEBUG,
-          "RDPECAM TX ChannelId=%" PRIu32
-          " MessageId=0x05 DeviceAddedNotification (default virtual camera) "
-          "result=%u",
-          enum_channel_id, result);
-    }
-    if (rs)
-      Stream_Free(rs, TRUE);
-
-    return;
-  }
-
-  guac_client_log(client, GUAC_LOG_DEBUG,
-                  "RDPECAM sending DeviceAddedNotification for %u real "
-                  "device(s)",
-                  device_count);
-
-  /* Send DeviceAddedNotification for each real device */
-  for (unsigned int i = 0; i < device_count; i++) {
-    guac_rdp_rdpecam_device_caps *caps = &rdp_client->rdpecam_device_caps[i];
-
-    /* Generate channel name: "RDCamera_Device_N" */
-    char channel_name[64];
-    snprintf(channel_name, sizeof(channel_name), "RDCamera_Device_%u", i);
-
-    /* Get device name with fallback */
-    const char *device_name = "Redirected-Cam0";
-    char fallback_name[64];
-    if (caps->device_name && caps->device_name[0] != '\0') {
-      device_name = caps->device_name;
-    } else {
-      snprintf(fallback_name, sizeof(fallback_name), "Redirected-Cam%u", i);
-      device_name = fallback_name;
-    }
-
-    /* Store device ID to channel name mapping */
-    if (caps->device_id && caps->device_id[0] != '\0') {
-      if (!guac_rdp_rdpecam_mapping_add(plugin, caps->device_id, channel_name)) {
-        guac_client_log(client, GUAC_LOG_ERROR,
-                        "RDPECAM failed to record device mapping for '%s'",
-                        caps->device_id);
-        continue;
-      }
-    }
-
-    /* Create listener for this device channel */
-    if (plugin->manager) {
-      guac_rdp_rdpecam_listener_callback *device_listener =
-          guac_mem_zalloc(sizeof(guac_rdp_rdpecam_listener_callback));
-      if (device_listener) {
-        /* Allocate and copy channel name for listener */
-        char *saved_channel_name = guac_mem_alloc(strlen(channel_name) + 1);
-        if (saved_channel_name) {
-          strcpy(saved_channel_name, channel_name);
-          device_listener->client = client;
-          device_listener->channel_name = saved_channel_name;
-          device_listener->plugin = plugin;
-          device_listener->parent.OnNewChannelConnection =
-              guac_rdp_rdpecam_new_connection;
-
-          /* Register listener for this device channel */
-          plugin->manager->CreateListener(
-              plugin->manager, channel_name, 0,
-              (IWTSListenerCallback *)device_listener, NULL);
-
-          guac_client_log(client, GUAC_LOG_DEBUG,
-                          "RDPECAM registered listener for device channel: %s",
-                          channel_name);
-        } else {
-          guac_mem_free(device_listener);
-        }
-      }
-    }
-
-    /* Send DeviceAddedNotification */
-    wStream *rs = Stream_New(NULL, 256);
-    if (rs && rdpecam_build_device_added(rs, device_name, channel_name)) {
-      Stream_SealLength(rs);
-      const size_t out_len = Stream_Length(rs);
-
-      UINT32 enum_channel_id = 0;
-      if (plugin->manager && plugin->manager->GetChannelId)
-        enum_channel_id = plugin->manager->GetChannelId(enumerator_channel);
-
-      guac_rdp_rdpecam_log_stream(client, "TX", "RDCamera_Device_Enumerator",
-                                  enum_channel_id, rs);
-      pthread_mutex_lock(&(rdp_client->message_lock));
-      UINT result =
-          plugin->enumerator_channel->Write(plugin->enumerator_channel,
-                                            (UINT32)out_len, Stream_Buffer(rs),
-                                            NULL);
-      pthread_mutex_unlock(&(rdp_client->message_lock));
-
-      guac_client_log(
-          client, GUAC_LOG_DEBUG,
-          "RDPECAM TX ChannelId=%" PRIu32
-          " MessageId=0x05 DeviceAddedNotification (device='%s', channel='%s') "
-          "result=%u",
-          enum_channel_id, device_name, channel_name, result);
-    }
-    if (rs)
-      Stream_Free(rs, TRUE);
   }
 }
 
@@ -3128,4 +2600,5 @@ UINT DVCPluginEntry(IDRDYNVC_ENTRY_POINTS *pEntryPoints) {
   }
 
   return CHANNEL_RC_OK;
+}
 }
