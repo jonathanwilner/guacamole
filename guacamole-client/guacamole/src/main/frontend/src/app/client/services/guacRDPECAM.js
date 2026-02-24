@@ -40,6 +40,8 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     const DEVICE_ENUMERATION_DEBOUNCE_MS = 350;
     const RDPECAM_DEBUG_PAYLOAD_LIMIT = 1800;
     const CAMERA_RESTART_GRACE_MS = 250;
+    const CONSERVATIVE_CLIENT_FPS = 10;
+    const CAMERA_AUTO_RESTART_DELAYS_MS = [400, 900, 1800];
 
     /**
      * Default camera constraints for RDPECAM.
@@ -51,8 +53,8 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     const DEFAULT_CONSTRAINTS = { width: 640, height: 480, frameRate: 15 };
 
     const CAPABILITY_CANDIDATES = [
-        { width: 640,  height: 480,  fps: [15, 30] },
-        { width: 320,  height: 240,  fps: [15, 30] },
+        { width: 640,  height: 480,  fps: [10, 15, 30] },
+        { width: 320,  height: 240,  fps: [10, 15, 30] },
         { width: 1280, height: 720,  fps: [30]      },
         { width: 1920, height: 1080, fps: [30]      }
     ];
@@ -60,8 +62,8 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     // More conservative set for mobile browsers where camera constraints and
     // hardware encoders are less predictable.
     const MOBILE_CAPABILITY_CANDIDATES = [
-        { width: 640,  height: 480,  fps: [15, 30] },
-        { width: 320,  height: 240,  fps: [15, 30] }
+        { width: 640,  height: 480,  fps: [10, 15] },
+        { width: 320,  height: 240,  fps: [10, 15] }
     ];
 
     const probedClients = new WeakSet();
@@ -275,6 +277,35 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
             frameRate: frameRate,
             deviceId: c.deviceId || null
         };
+    }
+
+    /**
+     * Returns normalized constraints tuned for the active browser class.
+     * Linux/Android/Harmony clients use a conservative fixed profile to reduce
+     * camera pipeline stalls seen by Teams and other WebRTC apps.
+     *
+     * @param {Object} constraints
+     *     Raw constraints object.
+     *
+     * @returns {{width:number,height:number,frameRate:number,deviceId:(string|undefined)}}
+     *     Constraints normalized for capture startup.
+     *
+     * @private
+     */
+    function normalizeCaptureConstraintsForClient(constraints) {
+        var normalized = normalizeComparableConstraints(constraints);
+        var conservativeProfile = isLinuxDesktopClient() || isAndroidLikeClient();
+
+        if (conservativeProfile) {
+            normalized.width = Math.min(normalized.width, 640);
+            normalized.height = Math.min(normalized.height, 480);
+            normalized.frameRate = CONSERVATIVE_CLIENT_FPS;
+        }
+
+        if (!normalized.deviceId)
+            delete normalized.deviceId;
+
+        return normalized;
     }
 
     /**
@@ -1141,6 +1172,85 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
         });
     }
 
+    /**
+     * Clears pending automatic restart state for the given client.
+     *
+     * @param {string} clientId
+     *     The local client ID.
+     *
+     * @private
+     */
+    function clearAutoRestartState(clientId) {
+        if (!clientId)
+            return;
+
+        if (cameraAutoRestartTimers[clientId]) {
+            clearTimeout(cameraAutoRestartTimers[clientId]);
+            delete cameraAutoRestartTimers[clientId];
+        }
+
+        delete cameraAutoRestartAttempts[clientId];
+    }
+
+    /**
+     * Schedules an automatic restart after a recorder runtime failure.
+     *
+     * @param {Guacamole.Client} client
+     *     The Guacamole client.
+     *
+     * @param {Object} constraints
+     *     The normalized constraints to reuse.
+     *
+     * @param {Function} [onState]
+     *     Optional state callback.
+     *
+     * @param {string} reason
+     *     Diagnostic reason string.
+     *
+     * @private
+     */
+    function scheduleAutoRestart(client, constraints, onState, reason) {
+        var clientId = getLocalClientId(client);
+        if (!clientId)
+            return;
+
+        if (cameraAutoRestartBlocked[clientId])
+            return;
+
+        if (cameraAutoRestartTimers[clientId])
+            return;
+
+        var attempt = cameraAutoRestartAttempts[clientId] || 0;
+        var delay = CAMERA_AUTO_RESTART_DELAYS_MS[Math.min(attempt, CAMERA_AUTO_RESTART_DELAYS_MS.length - 1)];
+        cameraAutoRestartAttempts[clientId] = attempt + 1;
+
+        sendRDPECAMDebugTelemetry(client, 'camera-auto-restart-scheduled', {
+            attempt: cameraAutoRestartAttempts[clientId],
+            delayMs: delay,
+            reason: reason || 'unknown'
+        });
+
+        cameraAutoRestartTimers[clientId] = setTimeout(function() {
+            delete cameraAutoRestartTimers[clientId];
+
+            if (cameraAutoRestartBlocked[clientId])
+                return;
+
+            startCamera(client, constraints, onState).then(function() {
+                cameraAutoRestartAttempts[clientId] = 0;
+                sendRDPECAMDebugTelemetry(client, 'camera-auto-restart-success', {
+                    reason: reason || 'unknown'
+                });
+            }).catch(function(error) {
+                sendRDPECAMDebugTelemetry(client, 'camera-auto-restart-failed', {
+                    reason: reason || 'unknown',
+                    error: error && error.message ? error.message : String(error)
+                });
+                scheduleAutoRestart(client, constraints, onState, 'start-failed');
+            });
+        }, delay);
+    }
+
 
     /**
      * Starts camera redirection for the given client.
@@ -1163,13 +1273,21 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     function startCamera(client, constraints, onState) {
 
         // Use default constraints if none provided
-        constraints = constraints || DEFAULT_CONSTRAINTS;
+        constraints = normalizeCaptureConstraintsForClient(constraints || DEFAULT_CONSTRAINTS);
 
         return new Promise((resolve, reject) => {
 
             try {
                 // Ensure single recorder per client: stop any existing one first
                 var existingClientId = getLocalClientId(client);
+                if (existingClientId) {
+                    cameraAutoRestartBlocked[existingClientId] = false;
+                    if (cameraAutoRestartTimers[existingClientId]) {
+                        clearTimeout(cameraAutoRestartTimers[existingClientId]);
+                        delete cameraAutoRestartTimers[existingClientId];
+                    }
+                }
+
                 if (existingClientId && (cameraControllers[existingClientId] || cameraRecorders[existingClientId])) {
                     var existingState = cameraStates[existingClientId] || null;
                     var existingConstraints = existingState ? existingState.activeConstraints : null;
@@ -1268,6 +1386,12 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                         var deviceId = state ? state.deviceId : null;
                         if (state)
                             state.activeConstraints = null;
+                        if (cameraControllers[clientId])
+                            delete cameraControllers[clientId];
+                        if (cameraRecorders[clientId])
+                            delete cameraRecorders[clientId];
+                        stopQueueTimer(clientId);
+                        clearDelayQueue(clientId);
                         updateCameraState(clientId, false, deviceId);
                     }
 
@@ -1282,11 +1406,18 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                 recorder.onerror = function() {
                     // Update state to inactive on error
                     var clientId = getLocalClientId(client);
+                    var shouldAutoRestart = isLinuxDesktopClient() || isAndroidLikeClient();
                     if (clientId) {
                         var state = cameraStates[clientId] || null;
                         var deviceId = state ? state.deviceId : null;
                         if (state)
                             state.activeConstraints = null;
+                        if (cameraControllers[clientId])
+                            delete cameraControllers[clientId];
+                        if (cameraRecorders[clientId])
+                            delete cameraRecorders[clientId];
+                        stopQueueTimer(clientId);
+                        clearDelayQueue(clientId);
                         updateCameraState(clientId, false, deviceId);
                     }
 
@@ -1296,6 +1427,9 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                     if (onState) {
                         onState({ running: false, error: true });
                     }
+
+                    if (shouldAutoRestart)
+                        scheduleAutoRestart(client, constraints, onState, 'recorder-error');
                 };
 
                 // Do not override stream.onack — the underlying writer uses
@@ -1303,6 +1437,11 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
 
                 // Create stop function
                 var stopFunction = function() {
+                    if (clientId) {
+                        cameraAutoRestartBlocked[clientId] = true;
+                        clearAutoRestartState(clientId);
+                    }
+
                     recorder.stop();
                     stream.sendEnd();
                     clearCameraDebugHook(client);
@@ -1322,6 +1461,12 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                 if (clientId) {
                     cameraRecorders[clientId] = recorder;
                     cameraControllers[clientId] = stopFunction;  // Register BEFORE resolving promise
+                    cameraAutoRestartBlocked[clientId] = false;
+                    if (cameraAutoRestartTimers[clientId]) {
+                        clearTimeout(cameraAutoRestartTimers[clientId]);
+                        delete cameraAutoRestartTimers[clientId];
+                    }
+                    cameraAutoRestartAttempts[clientId] = 0;
                     
                     // Store deviceId in cameraStates for later use when stopping
                     if (!cameraStates[clientId]) {
@@ -1450,6 +1595,31 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
      * @private
      */
     var cameraStates = {};
+
+    /**
+     * Pending automatic restart timers keyed by client ID.
+     *
+     * @type {Object.<string, number>}
+     * @private
+     */
+    var cameraAutoRestartTimers = {};
+
+    /**
+     * Automatic restart attempt counters keyed by client ID.
+     *
+     * @type {Object.<string, number>}
+     * @private
+     */
+    var cameraAutoRestartAttempts = {};
+
+    /**
+     * Explicit stop marker keyed by client ID. If true, auto-restart is
+     * suppressed until the next explicit start request.
+     *
+     * @type {Object.<string, boolean>}
+     * @private
+     */
+    var cameraAutoRestartBlocked = {};
 
     /**
      * Map of client IDs to their UI state update callbacks.
@@ -1773,6 +1943,9 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
         if (!clientId) {
             return;
         }
+
+        cameraAutoRestartBlocked[clientId] = true;
+        clearAutoRestartState(clientId);
 
         // Check if camera is already stopped
         if (!cameraControllers[clientId]) {

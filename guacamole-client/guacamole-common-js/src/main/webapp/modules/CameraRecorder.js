@@ -159,6 +159,12 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         deviceId: undefined
     };
 
+    var CONSERVATIVE_CLIENT_MAX_WIDTH = 640;
+    var CONSERVATIVE_CLIENT_MAX_HEIGHT = 480;
+    var CONSERVATIVE_CLIENT_FIXED_FPS = 10;
+    var CADENCE_REPEAT_MULTIPLIER = 2;
+    var CAMERA_STALL_TIMEOUT_MS = 5000;
+
     /**
      * Returns the browser user agent string if available.
      *
@@ -265,8 +271,8 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      * @type {!Array.<{width:number,height:number,fps:!Array.<number>}>}
      */
     var CAPABILITY_CANDIDATES = [
-        { width: 640,  height: 480,  fps: [30, 15] },
-        { width: 320,  height: 240,  fps: [30, 15] },
+        { width: 640,  height: 480,  fps: [30, 15, 10] },
+        { width: 320,  height: 240,  fps: [30, 15, 10] },
         { width: 1280, height: 720,  fps: [30]      },
         { width: 1920, height: 1080, fps: [30]      }
     ];
@@ -278,8 +284,8 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      * @type {!Array.<{width:number,height:number,fps:!Array.<number>}>}
      */
     var MOBILE_CAPABILITY_CANDIDATES = [
-        { width: 640,  height: 480,  fps: [15, 30] },
-        { width: 320,  height: 240,  fps: [15, 30] }
+        { width: 640,  height: 480,  fps: [10, 15] },
+        { width: 320,  height: 240,  fps: [10, 15] }
     ];
 
     /**
@@ -608,6 +614,8 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         var candidates = [];
         var seen = {};
         var androidLike = isAndroidLikeBrowser();
+        var linuxDesktop = isLinuxDesktopBrowser();
+        var conservativeProfile = androidLike || linuxDesktop;
 
         var pushCandidate = function pushCandidate(videoConstraints) {
             var key = (typeof videoConstraints === 'boolean')
@@ -621,7 +629,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             candidates.push(videoConstraints);
         };
 
-        var baseVideoConstraints = {
+        var baseVideoConstraints = conservativeProfile ? {
+            width: { ideal: format.width, max: format.width },
+            height: { ideal: format.height, max: format.height },
+            frameRate: { ideal: format.frameRate, max: format.frameRate }
+        } : {
             width: format.width,
             height: format.height,
             frameRate: format.frameRate
@@ -639,7 +651,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                 }));
             }
 
-            if (androidLike) {
+            if (conservativeProfile) {
                 pushCandidate(Object.assign({}, baseVideoConstraints, {
                     deviceId: { ideal: format.deviceId }
                 }));
@@ -650,9 +662,9 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
 
         if (androidLike) {
             pushCandidate({
-                width: { ideal: 640, max: 640 },
-                height: { ideal: 480, max: 480 },
-                frameRate: { ideal: 15, max: 15 }
+                width: { ideal: CONSERVATIVE_CLIENT_MAX_WIDTH, max: CONSERVATIVE_CLIENT_MAX_WIDTH },
+                height: { ideal: CONSERVATIVE_CLIENT_MAX_HEIGHT, max: CONSERVATIVE_CLIENT_MAX_HEIGHT },
+                frameRate: { ideal: CONSERVATIVE_CLIENT_FIXED_FPS, max: CONSERVATIVE_CLIENT_FIXED_FPS }
             });
         }
 
@@ -715,6 +727,58 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     var writer = new Guacamole.ArrayBufferWriter(stream);
 
     /**
+     * Timer used to monitor source frame cadence and emit repeated frames if
+     * input capture stalls temporarily.
+     *
+     * @private
+     * @type {number|null}
+     */
+    var cadenceWatchdogTimer = null;
+
+    /**
+     * Wall-clock timestamp of the last source frame read from the camera
+     * track processor.
+     *
+     * @private
+     * @type {number}
+     */
+    var lastSourceFrameWallMs = 0;
+
+    /**
+     * Wall-clock timestamp of the last frame emitted into the Guacamole output
+     * stream (real or repeated).
+     *
+     * @private
+     * @type {number}
+     */
+    var lastOutputFrameWallMs = 0;
+
+    /**
+     * Last successfully emitted frame payload.
+     *
+     * @private
+     * @type {Uint8Array|null}
+     */
+    var lastFramePayload = null;
+
+    /**
+     * Last emitted keyframe payload (preferred for repeated keepalive frames).
+     *
+     * @private
+     * @type {Uint8Array|null}
+     */
+    var lastKeyframePayload = null;
+
+    /**
+     * Whether a stall recovery has already been triggered for the current
+     * capture session.
+     *
+     * @private
+     * @type {boolean}
+     */
+    var stallRecoveryTriggered = false;
+
+    /**
      * Builds the RDPECAM frame header.
      *
      * @private
@@ -771,6 +835,113 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         }
 
         return result.buffer;
+    };
+
+    /**
+     * Returns the expected frame interval based on current target FPS.
+     *
+     * @private
+     * @returns {number}
+     */
+    var getTargetFrameIntervalMs = function getTargetFrameIntervalMs() {
+        var fps = Number(format.frameRate);
+        if (!isFinite(fps) || fps <= 0)
+            fps = 15;
+
+        return Math.max(50, Math.round(1000 / fps));
+    };
+
+    /**
+     * Emits a repeated frame (preferably keyframe) with an updated timestamp.
+     *
+     * @private
+     * @param {string} reason
+     * @returns {boolean}
+     */
+    var emitRepeatedFrame = function emitRepeatedFrame(reason) {
+        var payload = lastKeyframePayload || lastFramePayload;
+        if (!payload || !payload.length)
+            return false;
+
+        var payloadSize = payload.length;
+        var intervalMs = getTargetFrameIntervalMs();
+        var nextPtsMs = (lastOutputPtsMs === null) ? 0 : (lastOutputPtsMs + intervalMs);
+        var repeatedAsKeyframe = (payload === lastKeyframePayload);
+
+        var header = buildFrameHeader({
+            keyframe: repeatedAsKeyframe,
+            ptsMs: nextPtsMs,
+            payloadLen: payloadSize
+        });
+
+        var payloadBuffer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payloadSize);
+        var frameData = concatBuffers(header, payloadBuffer);
+        writer.sendData(frameData);
+
+        lastOutputPtsMs = nextPtsMs;
+        lastOutputFrameWallMs = Date.now();
+
+        emitDebugEvent('camera-frame-repeat', {
+            reason: reason || 'unspecified',
+            ptsMs: nextPtsMs,
+            keyframe: repeatedAsKeyframe,
+            payloadBytes: payloadSize
+        });
+
+        return true;
+    };
+
+    /**
+     * Stops the frame cadence/stall watchdog timer, if active.
+     *
+     * @private
+     */
+    var stopCadenceWatchdog = function stopCadenceWatchdog() {
+        if (cadenceWatchdogTimer !== null) {
+            clearInterval(cadenceWatchdogTimer);
+            cadenceWatchdogTimer = null;
+        }
+    };
+
+    /**
+     * Starts a watchdog that repeats the last frame when output cadence drops
+     * and triggers capture restart if the source stalls.
+     *
+     * @private
+     */
+    var startCadenceWatchdog = function startCadenceWatchdog() {
+        stopCadenceWatchdog();
+
+        if (!(isLinuxDesktopBrowser() || isAndroidLikeBrowser()))
+            return;
+
+        stallRecoveryTriggered = false;
+        lastSourceFrameWallMs = Date.now();
+        lastOutputFrameWallMs = Date.now();
+
+        var pollIntervalMs = Math.max(120, Math.floor(getTargetFrameIntervalMs() / 2));
+        cadenceWatchdogTimer = setInterval(function() {
+            if (captureStartAborted || !mediaStream || !encoder)
+                return;
+
+            var now = Date.now();
+            var frameIntervalMs = getTargetFrameIntervalMs();
+            var sourceIdleMs = now - lastSourceFrameWallMs;
+            var outputIdleMs = now - lastOutputFrameWallMs;
+
+            if (outputIdleMs >= (frameIntervalMs * CADENCE_REPEAT_MULTIPLIER))
+                emitRepeatedFrame('output-cadence-gap');
+
+            if (!stallRecoveryTriggered && sourceIdleMs >= CAMERA_STALL_TIMEOUT_MS) {
+                stallRecoveryTriggered = true;
+                emitDebugEvent('camera-source-stall-detected', {
+                    sourceIdleMs: sourceIdleMs,
+                    outputIdleMs: outputIdleMs,
+                    frameRate: format.frameRate
+                });
+                streamDenied();
+            }
+        }, pollIntervalMs);
     };
 
     /**
@@ -1091,6 +1262,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                     relativePtsMs = lastOutputPtsMs;
 
                 lastOutputPtsMs = relativePtsMs;
+                lastOutputFrameWallMs = Date.now();
 
                 var header = buildFrameHeader({
                     keyframe: chunk.type === 'key',
@@ -1098,7 +1270,13 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                     payloadLen: payloadSize
                 });
 
-                var payloadBuffer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payloadSize);
+                var payloadCopy = new Uint8Array(payloadSize);
+                payloadCopy.set(payload);
+                lastFramePayload = payloadCopy;
+                if (chunk.type === 'key')
+                    lastKeyframePayload = payloadCopy;
+
+                var payloadBuffer = payloadCopy.buffer.slice(payloadCopy.byteOffset, payloadCopy.byteOffset + payloadSize);
                 var frameData = concatBuffers(header, payloadBuffer);
                 writer.sendData(frameData);
             },
@@ -1144,6 +1322,9 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             reportCapabilities(track);
             processor = new MediaStreamTrackProcessor({ track: track });
             reader = processor.readable.getReader();
+            lastSourceFrameWallMs = Date.now();
+            lastOutputFrameWallMs = Date.now();
+            startCadenceWatchdog();
 
             // Start encoding loop
             (async function() {
@@ -1152,6 +1333,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                     if (result.done)
                         break;
 
+                    lastSourceFrameWallMs = Date.now();
                     var wantPeriodicIdr = (Date.now() - lastKeyframeWallMs) >= forceIdrIntervalMs;
                     var requestKey = needKeyframe || wantPeriodicIdr;
                     encoder.encode(result.value, { keyFrame: !!requestKey });
@@ -1177,6 +1359,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      */
     var streamDenied = function streamDenied() {
         captureStartAborted = true;
+        stopCadenceWatchdog();
         if (pendingCaptureRetryTimer !== null) {
             clearTimeout(pendingCaptureRetryTimer);
             pendingCaptureRetryTimer = null;
@@ -1211,6 +1394,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         decoderConfig = null;
         baselinePtsUs = null;
         lastOutputPtsMs = null;
+        lastSourceFrameWallMs = 0;
+        lastOutputFrameWallMs = 0;
+        lastFramePayload = null;
+        lastKeyframePayload = null;
+        stallRecoveryTriggered = false;
         requireKeyframe();
         lastKeyframeWallMs = Date.now();
 
@@ -1326,6 +1514,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      */
     var stopVideoCapture = function stopVideoCapture() {
         captureStartAborted = true;
+        stopCadenceWatchdog();
         if (pendingCaptureRetryTimer !== null) {
             clearTimeout(pendingCaptureRetryTimer);
             pendingCaptureRetryTimer = null;
@@ -1343,6 +1532,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         baselinePtsUs = null;
         
         lastOutputPtsMs = null;
+        lastSourceFrameWallMs = 0;
+        lastOutputFrameWallMs = 0;
+        lastFramePayload = null;
+        lastKeyframePayload = null;
+        stallRecoveryTriggered = false;
         requireKeyframe();
         lastKeyframeWallMs = Date.now();
 
@@ -1373,6 +1567,8 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     this.resetTimeline = function resetTimeline() {
         baselinePtsUs = null;
         lastOutputPtsMs = null;
+        lastSourceFrameWallMs = Date.now();
+        lastOutputFrameWallMs = Date.now();
         
         requireKeyframe();
     };
@@ -1394,30 +1590,29 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
 
         var linuxDesktop = isLinuxDesktopBrowser();
         var androidLike = isAndroidLikeBrowser();
+        var conservativeProfile = linuxDesktop || androidLike;
 
         if (typeof c.width === 'number')  format.width  = c.width;
         if (typeof c.height === 'number') format.height = c.height;
 
-        if (androidLike) {
-            // Keep Android/HarmonyOS constraints conservative to improve
+        if (conservativeProfile) {
+            // Keep Linux/Android/HarmonyOS constraints conservative to improve
             // camera and encoder startup reliability.
             if (typeof format.width === 'number')
-                format.width = Math.min(format.width, 640);
+                format.width = Math.min(format.width, CONSERVATIVE_CLIENT_MAX_WIDTH);
             if (typeof format.height === 'number')
-                format.height = Math.min(format.height, 480);
+                format.height = Math.min(format.height, CONSERVATIVE_CLIENT_MAX_HEIGHT);
         }
 
         if (typeof c.frameRate === 'number') {
             var targetFrameRate = c.frameRate;
 
-            // Linux Chrome is less consistent with H.264 encoder startup at
-            // 30 FPS. Cap requested FPS to 15 to improve RDPECAM stability.
-            if (linuxDesktop || androidLike) {
-                targetFrameRate = Math.min(targetFrameRate, 15);
-            }
-
             format.frameRate = targetFrameRate;
         }
+
+        if (conservativeProfile)
+            format.frameRate = CONSERVATIVE_CLIENT_FIXED_FPS;
+
         if (c.deviceId) format.deviceId = c.deviceId;
     };
     /**
