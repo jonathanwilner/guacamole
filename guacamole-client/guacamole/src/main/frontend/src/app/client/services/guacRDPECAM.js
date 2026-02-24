@@ -62,8 +62,8 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     // More conservative set for mobile browsers where camera constraints and
     // hardware encoders are less predictable.
     const MOBILE_CAPABILITY_CANDIDATES = [
-        { width: 640,  height: 480,  fps: [10, 15] },
-        { width: 320,  height: 240,  fps: [10, 15] }
+        { width: 640,  height: 480,  fps: [10, 15, 30] },
+        { width: 320,  height: 240,  fps: [10, 15, 30] }
     ];
 
     const probedClients = new WeakSet();
@@ -287,7 +287,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
      * @param {Object} constraints
      *     Raw constraints object.
      *
-     * @returns {{width:number,height:number,frameRate:number,deviceId:(string|undefined)}}
+     * @returns {{width:number,height:number,frameRate:number,maxFrameRate:number,deviceId:(string|undefined)}}
      *     Constraints normalized for capture startup.
      *
      * @private
@@ -295,11 +295,22 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
     function normalizeCaptureConstraintsForClient(constraints) {
         var normalized = normalizeComparableConstraints(constraints);
         var conservativeProfile = isLinuxDesktopClient() || isAndroidLikeClient();
+        var requestedFrameRate = Number((constraints || {}).maxFrameRate || (constraints || {}).frameRate);
+
+        if (!isFinite(requestedFrameRate) || requestedFrameRate <= 0)
+            requestedFrameRate = normalized.frameRate;
 
         if (conservativeProfile) {
             normalized.width = Math.min(normalized.width, 640);
             normalized.height = Math.min(normalized.height, 480);
             normalized.frameRate = CONSERVATIVE_CLIENT_FPS;
+            normalized.maxFrameRate = Math.max(
+                CONSERVATIVE_CLIENT_FPS,
+                Math.min(30, Math.round(requestedFrameRate))
+            );
+        }
+        else {
+            normalized.maxFrameRate = Math.max(1, Math.round(requestedFrameRate));
         }
 
         if (!normalized.deviceId)
@@ -1348,6 +1359,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
                     width: constraints.width,
                     height: constraints.height,
                     frameRate: constraints.frameRate,
+                    maxFrameRate: constraints.maxFrameRate || constraints.frameRate,
                     deviceId: constraints.deviceId || null,
                     userAgent: getUserAgentString()
                 });
@@ -1550,6 +1562,7 @@ angular.module('client').factory('guacRDPECAM', ['$injector', function guacRDPEC
             height: constraints.height,
             fpsNum: params.fpsNum,
             fpsDen: params.fpsDenom,
+            maxFrameRate: constraints.maxFrameRate || constraints.frameRate,
             streamIndex: params.streamIndex,
             deviceId: constraints.deviceId || null
         });

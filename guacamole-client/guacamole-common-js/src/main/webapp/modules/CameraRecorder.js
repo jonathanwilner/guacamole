@@ -164,6 +164,8 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     var CONSERVATIVE_CLIENT_FIXED_FPS = 10;
     var CADENCE_REPEAT_MULTIPLIER = 2;
     var CAMERA_STALL_TIMEOUT_MS = 5000;
+    var ADAPTIVE_RAMP_INITIAL_DELAY_MS = 7000;
+    var ADAPTIVE_RAMP_STEP_DELAY_MS = 10000;
 
     /**
      * Returns the browser user agent string if available.
@@ -248,6 +250,17 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     };
 
     /**
+     * Returns whether this browser should use conservative startup + adaptive
+     * ramp behavior.
+     *
+     * @private
+     * @returns {boolean}
+     */
+    var isConservativeProfileBrowser = function isConservativeProfileBrowser() {
+        return isLinuxDesktopBrowser() || isAndroidLikeBrowser();
+    };
+
+    /**
      * Monotonic PTS last emitted downstream (milliseconds).
      *
      * @private
@@ -284,8 +297,8 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      * @type {!Array.<{width:number,height:number,fps:!Array.<number>}>}
      */
     var MOBILE_CAPABILITY_CANDIDATES = [
-        { width: 640,  height: 480,  fps: [10, 15] },
-        { width: 320,  height: 240,  fps: [10, 15] }
+        { width: 640,  height: 480,  fps: [10, 15, 30] },
+        { width: 320,  height: 240,  fps: [10, 15, 30] }
     ];
 
     /**
@@ -421,12 +434,45 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     var pendingCaptureRetryTimer = null;
 
     /**
+     * Pending timer used for adaptive frame-rate ramping after conservative
+     * startup succeeds.
+     *
+     * @private
+     * @type {number|null}
+     */
+    var adaptiveRampTimer = null;
+
+    /**
+     * Maximum FPS target allowed for adaptive ramping.
+     *
+     * @private
+     * @type {number}
+     */
+    var adaptiveMaxFrameRate = 30;
+
+    /**
+     * The active capture track, if available.
+     *
+     * @private
+     * @type {MediaStreamTrack|null}
+     */
+    var captureTrack = null;
+
+    /**
      * The video encoder instance.
      *
      * @private
      * @type {VideoEncoder}
      */
     var encoder = null;
+
+    /**
+     * The last encoder config accepted by configureEncoderWithFallback().
+     *
+     * @private
+     * @type {Object|null}
+     */
+    var activeEncoderConfig = null;
 
     /**
      * The media stream track processor.
@@ -912,7 +958,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     var startCadenceWatchdog = function startCadenceWatchdog() {
         stopCadenceWatchdog();
 
-        if (!(isLinuxDesktopBrowser() || isAndroidLikeBrowser()))
+        if (!isConservativeProfileBrowser())
             return;
 
         stallRecoveryTriggered = false;
@@ -942,6 +988,157 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                 streamDenied();
             }
         }, pollIntervalMs);
+    };
+
+    /**
+     * Stops the adaptive frame-rate ramp timer.
+     *
+     * @private
+     */
+    var stopAdaptiveRampTimer = function stopAdaptiveRampTimer() {
+        if (adaptiveRampTimer !== null) {
+            clearTimeout(adaptiveRampTimer);
+            adaptiveRampTimer = null;
+        }
+    };
+
+    /**
+     * Returns ordered FPS targets used for adaptive ramp-up.
+     *
+     * @private
+     * @returns {!Array.<number>}
+     */
+    var buildAdaptiveRampSteps = function buildAdaptiveRampSteps() {
+        var maxFps = Math.max(
+            CONSERVATIVE_CLIENT_FIXED_FPS,
+            Math.round(Number(adaptiveMaxFrameRate) || CONSERVATIVE_CLIENT_FIXED_FPS)
+        );
+
+        var stepsByValue = {};
+        [12, 15, 20, 24, maxFps].forEach(function(target) {
+            if (target > CONSERVATIVE_CLIENT_FIXED_FPS && target <= maxFps)
+                stepsByValue[target] = true;
+        });
+
+        return Object.keys(stepsByValue).map(function(value) {
+            return parseInt(value, 10);
+        }).sort(function(a, b) {
+            return a - b;
+        });
+    };
+
+    /**
+     * Reconfigures the active encoder to the given frame rate, if possible.
+     *
+     * @private
+     * @param {number} targetFps
+     * @returns {boolean}
+     */
+    var reconfigureEncoderFrameRate = function reconfigureEncoderFrameRate(targetFps) {
+        if (!encoder || !activeEncoderConfig)
+            return false;
+
+        try {
+            var updatedConfig = Object.assign({}, activeEncoderConfig, {
+                framerate: targetFps
+            });
+            encoder.configure(updatedConfig);
+            activeEncoderConfig = updatedConfig;
+            return true;
+        }
+        catch (e) {
+            emitDebugEvent('encoder-reconfigure-failed', {
+                targetFps: targetFps,
+                name: e && e.name ? e.name : '',
+                message: e && e.message ? e.message : ''
+            });
+            return false;
+        }
+    };
+
+    /**
+     * Applies track frame-rate constraints, trying strict and relaxed forms.
+     *
+     * @private
+     * @param {MediaStreamTrack} track
+     * @param {number} targetFps
+     * @returns {Promise<boolean>}
+     */
+    var applyTrackFrameRate = function applyTrackFrameRate(track, targetFps) {
+        if (!track || typeof track.applyConstraints !== 'function')
+            return Promise.resolve(false);
+
+        return track.applyConstraints({
+            frameRate: { ideal: targetFps, max: targetFps }
+        }).then(function() {
+            return true;
+        }).catch(function() {
+            return track.applyConstraints({ frameRate: targetFps }).then(function() {
+                return true;
+            }).catch(function() {
+                return false;
+            });
+        });
+    };
+
+    /**
+     * Starts adaptive frame-rate ramping after conservative startup.
+     *
+     * @private
+     */
+    var startAdaptiveRamp = function startAdaptiveRamp() {
+        stopAdaptiveRampTimer();
+
+        if (!isConservativeProfileBrowser())
+            return;
+
+        var steps = buildAdaptiveRampSteps();
+        if (!steps.length || !captureTrack)
+            return;
+
+        var stepIndex = 0;
+        var attemptRampStep = function attemptRampStep() {
+            if (captureStartAborted || !mediaStream || !captureTrack) {
+                stopAdaptiveRampTimer();
+                return;
+            }
+
+            // Defer ramping while source cadence is unstable.
+            if ((Date.now() - lastSourceFrameWallMs) > Math.floor(CAMERA_STALL_TIMEOUT_MS / 2)) {
+                adaptiveRampTimer = setTimeout(attemptRampStep, ADAPTIVE_RAMP_STEP_DELAY_MS);
+                return;
+            }
+
+            var targetFps = steps[stepIndex];
+            applyTrackFrameRate(captureTrack, targetFps).then(function(applied) {
+                if (captureStartAborted || !mediaStream)
+                    return;
+
+                if (!applied) {
+                    emitDebugEvent('camera-adaptive-fps-upgrade-failed', {
+                        targetFps: targetFps
+                    });
+                    stopAdaptiveRampTimer();
+                    return;
+                }
+
+                format.frameRate = targetFps;
+                reconfigureEncoderFrameRate(targetFps);
+                emitDebugEvent('camera-adaptive-fps-upgrade', {
+                    targetFps: targetFps
+                });
+
+                stepIndex++;
+                if (stepIndex >= steps.length) {
+                    stopAdaptiveRampTimer();
+                    return;
+                }
+
+                adaptiveRampTimer = setTimeout(attemptRampStep, ADAPTIVE_RAMP_STEP_DELAY_MS);
+            });
+        };
+
+        adaptiveRampTimer = setTimeout(attemptRampStep, ADAPTIVE_RAMP_INITIAL_DELAY_MS);
     };
 
     /**
@@ -1182,6 +1379,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
 
                 var effectiveConfig = support.config || candidate;
                 encoder.configure(effectiveConfig);
+                activeEncoderConfig = effectiveConfig;
                 emitDebugEvent('encoder-config-selected', {
                     codec: effectiveConfig.codec,
                     width: effectiveConfig.width,
@@ -1293,6 +1491,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             track = stream.getVideoTracks()[0];
             if (!track)
                 throw new Error('Camera stream has no video track');
+            captureTrack = track;
 
             var settings = {};
             if (track && typeof track.getSettings === 'function') {
@@ -1325,6 +1524,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
             lastSourceFrameWallMs = Date.now();
             lastOutputFrameWallMs = Date.now();
             startCadenceWatchdog();
+            startAdaptiveRamp();
 
             // Start encoding loop
             (async function() {
@@ -1360,6 +1560,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     var streamDenied = function streamDenied() {
         captureStartAborted = true;
         stopCadenceWatchdog();
+        stopAdaptiveRampTimer();
         if (pendingCaptureRetryTimer !== null) {
             clearTimeout(pendingCaptureRetryTimer);
             pendingCaptureRetryTimer = null;
@@ -1390,7 +1591,9 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         processor = null;
         reader = null;
         encoder = null;
+        activeEncoderConfig = null;
         mediaStream = null;
+        captureTrack = null;
         decoderConfig = null;
         baselinePtsUs = null;
         lastOutputPtsMs = null;
@@ -1422,6 +1625,8 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
      */
     var beginVideoCapture = function beginVideoCapture() {
         captureStartAborted = false;
+        stopAdaptiveRampTimer();
+        captureTrack = null;
         if (pendingCaptureRetryTimer !== null) {
             clearTimeout(pendingCaptureRetryTimer);
             pendingCaptureRetryTimer = null;
@@ -1515,6 +1720,7 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     var stopVideoCapture = function stopVideoCapture() {
         captureStartAborted = true;
         stopCadenceWatchdog();
+        stopAdaptiveRampTimer();
         if (pendingCaptureRetryTimer !== null) {
             clearTimeout(pendingCaptureRetryTimer);
             pendingCaptureRetryTimer = null;
@@ -1553,7 +1759,9 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
         processor = null;
         reader = null;
         encoder = null;
+        activeEncoderConfig = null;
         mediaStream = null;
+        captureTrack = null;
 
         // End stream
         writer.sendEnd();
@@ -1588,9 +1796,11 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
     this.setFormat = function setFormat(c) {
         if (!c) return;
 
-        var linuxDesktop = isLinuxDesktopBrowser();
-        var androidLike = isAndroidLikeBrowser();
-        var conservativeProfile = linuxDesktop || androidLike;
+        var conservativeProfile = isConservativeProfileBrowser();
+        var requestedFrameRate = Number(c.maxFrameRate || c.frameRate);
+
+        if (!isFinite(requestedFrameRate) || requestedFrameRate <= 0)
+            requestedFrameRate = Number(format.frameRate) || 15;
 
         if (typeof c.width === 'number')  format.width  = c.width;
         if (typeof c.height === 'number') format.height = c.height;
@@ -1604,14 +1814,20 @@ Guacamole.H264CameraRecorder = function H264CameraRecorder(stream, mimetype) {
                 format.height = Math.min(format.height, CONSERVATIVE_CLIENT_MAX_HEIGHT);
         }
 
-        if (typeof c.frameRate === 'number') {
-            var targetFrameRate = c.frameRate;
+        if (typeof c.frameRate === 'number')
+            format.frameRate = c.frameRate;
 
-            format.frameRate = targetFrameRate;
-        }
-
-        if (conservativeProfile)
+        if (conservativeProfile) {
+            adaptiveMaxFrameRate = Math.max(
+                CONSERVATIVE_CLIENT_FIXED_FPS,
+                Math.min(30, Math.round(requestedFrameRate))
+            );
             format.frameRate = CONSERVATIVE_CLIENT_FIXED_FPS;
+        }
+        else {
+            adaptiveMaxFrameRate = Math.max(1, Math.round(requestedFrameRate));
+            format.frameRate = adaptiveMaxFrameRate;
+        }
 
         if (c.deviceId) format.deviceId = c.deviceId;
     };
